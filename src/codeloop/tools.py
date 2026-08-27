@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,9 @@ MAX_READ_LINES = 200
 MAX_TEXT_CHARS = 20_000
 MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 50
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 60
+MAX_COMMAND_TIMEOUT_SECONDS = 300
+TERMINATION_GRACE_SECONDS = 2
 
 IGNORED_DIRECTORIES = {
     ".git",
@@ -160,6 +163,30 @@ def _decode_utf8(path: Path) -> str:
         ) from exc
 
 
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _detect_newline_style(text: str) -> str:
+    if "\r\n" in text:
+        return "\r\n"
+    if "\n" in text:
+        return "\n"
+    if "\r" in text:
+        return "\r"
+    return "\n"
+
+
+def _logical_lines(text: str) -> list[str]:
+    logical = _normalize_newlines(text)
+    if not logical:
+        return []
+    lines = logical.split("\n")
+    if logical.endswith("\n"):
+        lines.pop()
+    return lines
+
+
 def _truncate(text: str, limit: int = MAX_TEXT_CHARS) -> tuple[str, bool]:
     if len(text) <= limit:
         return text, False
@@ -272,6 +299,12 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
                     "minItems": 1,
                 },
                 "cwd": {"type": "string", "default": "."},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_COMMAND_TIMEOUT_SECONDS,
+                    "default": DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -283,8 +316,20 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 class ToolRegistry:
     """A direct registry of six workspace-bound coding tools."""
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        sensitive_values: Iterable[str] = (),
+    ) -> None:
         self._workspace = workspace
+        self._sensitive_values = tuple(
+            sorted(
+                {value for value in sensitive_values if value},
+                key=len,
+                reverse=True,
+            )
+        )
         self._tools = {
             "list_files": ToolDefinition(LIST_FILES_SCHEMA, self._list_files),
             "read_file": ToolDefinition(READ_FILE_SCHEMA, self._read_file),
@@ -314,8 +359,8 @@ class ToolRegistry:
             return definition.handler(arguments)
         except (ToolInputError, WorkspaceError) as exc:
             return _error(exc.error_code, exc.message, data=exc.data)
-        except OSError as exc:
-            return _error("tool_error", f"Local tool operation failed: {exc}")
+        except OSError:
+            return _error("tool_error", "The local tool operation failed.")
 
     def _list_files(self, arguments: dict[str, Any]) -> ToolResult:
         _validate_fields(arguments, allowed={"path", "max_depth"})
@@ -403,7 +448,7 @@ class ToolRegistry:
 
         path = self._workspace.resolve(path_value, expected="file")
         content = _decode_utf8(path)
-        lines = content.splitlines()
+        lines = _logical_lines(content)
         total_lines = len(lines)
         requested_end = end_value if end_value is not None else total_lines
         limited_end = min(requested_end, start_line + MAX_READ_LINES - 1, total_lines)
@@ -605,7 +650,11 @@ class ToolRegistry:
         new_text = _string_argument(arguments, "new_text")
         path = self._workspace.resolve(path_value, expected="file")
         content = _decode_utf8(path)
-        match_count = content.count(old_text)
+        newline_style = _detect_newline_style(content)
+        logical_content = _normalize_newlines(content)
+        logical_old_text = _normalize_newlines(old_text)
+        logical_new_text = _normalize_newlines(new_text)
+        match_count = logical_content.count(logical_old_text)
 
         if match_count == 0:
             return _error(
@@ -620,7 +669,12 @@ class ToolRegistry:
                 data={"matches": match_count},
             )
 
-        updated = content.replace(old_text, new_text, 1)
+        logical_updated = logical_content.replace(
+            logical_old_text,
+            logical_new_text,
+            1,
+        )
+        updated = logical_updated.replace("\n", newline_style)
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -634,7 +688,14 @@ class ToolRegistry:
                 temporary.flush()
                 os.fsync(temporary.fileno())
                 temporary_path = Path(temporary.name)
-            os.replace(temporary_path, path)
+            revalidated = self._workspace.resolve(path_value, expected="file")
+            if revalidated != path:
+                raise WorkspaceError(
+                    "invalid_path",
+                    "The edit target changed during execution.",
+                )
+            os.replace(temporary_path, revalidated)
+            path = revalidated
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
@@ -672,7 +733,7 @@ class ToolRegistry:
     def _run_command(self, arguments: dict[str, Any]) -> ToolResult:
         _validate_fields(
             arguments,
-            allowed={"command", "cwd"},
+            allowed={"command", "cwd", "timeout_seconds"},
             required={"command"},
         )
         command = arguments.get("command")
@@ -687,40 +748,133 @@ class ToolRegistry:
                 "command must be a non-empty array of strings",
             )
         cwd_value = _string_argument(arguments, "cwd", default=".")
+        timeout_seconds = _integer_argument(
+            arguments,
+            "timeout_seconds",
+            default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            minimum=1,
+            maximum=MAX_COMMAND_TIMEOUT_SECONDS,
+        )
         cwd = self._workspace.resolve(cwd_value, expected="directory")
 
         started = time.perf_counter()
         try:
-            completed = subprocess.run(
+            cwd = self._workspace.resolve(cwd_value, expected="directory")
+            process = subprocess.Popen(
                 command,
                 cwd=cwd,
                 shell=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
             )
         except FileNotFoundError:
             return _error(
                 "command_not_found",
-                f"Executable was not found: {command[0]}",
+                "The requested executable was not found.",
             )
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = self._terminate_and_collect(process)
+            duration_ms = round((time.perf_counter() - started) * 1000, 3)
+            data = self._command_result_data(
+                command=command,
+                cwd=cwd,
+                exit_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                timeout_seconds=timeout_seconds,
+                timed_out=True,
+                direct_child_reaped=process.poll() is not None,
+            )
+            return _error(
+                "command_timeout",
+                f"Command exceeded the {timeout_seconds} second timeout.",
+                data=data,
+            )
+        except KeyboardInterrupt:
+            self._terminate_and_collect(process)
+            raise
+
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
-        stdout, stdout_truncated = _truncate(completed.stdout)
-        stderr, stderr_truncated = _truncate(completed.stderr)
+        data = self._command_result_data(
+            command=command,
+            cwd=cwd,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            timeout_seconds=timeout_seconds,
+            timed_out=False,
+            direct_child_reaped=True,
+        )
+        if process.returncode != 0:
+            return _error(
+                "command_failed",
+                f"Command exited with code {process.returncode}",
+                data=data,
+            )
+        return _success(data)
+
+    def _terminate_and_collect(
+        self,
+        process: subprocess.Popen[str],
+    ) -> tuple[str, str]:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            stdout, stderr = process.communicate(
+                timeout=TERMINATION_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            stdout, stderr = process.communicate()
+        return stdout or "", stderr or ""
+
+    def _command_result_data(
+        self,
+        *,
+        command: list[str],
+        cwd: Path,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+        duration_ms: float,
+        timeout_seconds: int,
+        timed_out: bool,
+        direct_child_reaped: bool,
+    ) -> dict[str, Any]:
+        safe_command = [self._redact(value) for value in command]
+        stdout, stdout_truncated = _truncate(self._redact(stdout))
+        stderr, stderr_truncated = _truncate(self._redact(stderr))
         data = {
-            "command": command,
+            "command": safe_command,
             "cwd": self._workspace.relative_path(cwd),
-            "exit_code": completed.returncode,
+            "exit_code": exit_code,
             "stdout": stdout,
             "stderr": stderr,
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "duration_ms": duration_ms,
+            "timeout_seconds": timeout_seconds,
+            "timed_out": timed_out,
+            "direct_child_reaped": direct_child_reaped,
         }
-        if completed.returncode != 0:
-            return _error(
-                "command_failed",
-                f"Command exited with code {completed.returncode}",
-                data=data,
-            )
-        return _success(data)
+        return data
+
+    def _redact(self, value: str) -> str:
+        redacted = value
+        for sensitive in self._sensitive_values:
+            redacted = redacted.replace(sensitive, "[REDACTED]")
+        return redacted
