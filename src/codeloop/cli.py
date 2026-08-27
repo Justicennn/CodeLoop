@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from .agent import AgentRunner
 from .llm import OpenAICompatibleClient, ToolCall
-from .tools import ToolResult
+from .tools import ToolRegistry, ToolResult
+from .workspace import Workspace, WorkspaceError
 
 
 def _show_tool_event(tool_call: ToolCall, result: ToolResult) -> None:
@@ -20,6 +22,11 @@ def _show_tool_event(tool_call: ToolCall, result: ToolResult) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CodeLoop agent.")
     parser.add_argument("task", help="Task for the model to complete")
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace directory (default: current directory)",
+    )
     parser.add_argument("--max-steps", type=int, default=20)
     return parser
 
@@ -38,6 +45,8 @@ def main() -> int:
         return 2
 
     try:
+        workspace = Workspace(Path(args.workspace))
+        registry = ToolRegistry(workspace)
         client = OpenAICompatibleClient(
             api_key=api_key,
             base_url=base_url,
@@ -45,9 +54,13 @@ def main() -> int:
         )
         result = AgentRunner(
             client,
+            tools=registry,
             max_steps=args.max_steps,
             on_tool_event=_show_tool_event,
         ).run(args.task)
+    except WorkspaceError as exc:
+        print(f"Error: {exc.message}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130

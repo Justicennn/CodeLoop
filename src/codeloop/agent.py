@@ -31,14 +31,14 @@ class AgentRunner:
         self,
         client: ModelClient,
         *,
-        tools: ToolRegistry | None = None,
+        tools: ToolRegistry,
         max_steps: int = 20,
         on_tool_event: ToolEventHandler | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         self._client = client
-        self._tools = tools or ToolRegistry()
+        self._tools = tools
         self._max_steps = max_steps
         self._on_tool_event = on_tool_event
 
