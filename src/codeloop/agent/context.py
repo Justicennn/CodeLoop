@@ -16,6 +16,7 @@ MIN_CONTEXT_MESSAGES = 5
 MAX_CONTEXT_MESSAGES = 200
 
 _NOTICE_PREFIX = "Runtime context notice: "
+_RUNTIME_STATE_SEPARATOR = "\n\nRuntime task state:\n"
 
 
 class ConversationContext:
@@ -45,6 +46,7 @@ class ConversationContext:
             "role": "system",
             "content": system_prompt,
         }
+        self._runtime_state_json: str | None = None
         self._task_message: Message = {"role": "user", "content": task}
         self._max_chars = max_chars
         self._max_messages = max_messages
@@ -73,6 +75,23 @@ class ConversationContext:
         """Return a snapshot containing only pinned messages and complete cycles."""
         return deepcopy(self._compose_messages())
 
+    def set_runtime_state(self, snapshot: dict[str, Any] | None) -> None:
+        """Replace the current bounded runtime-state projection, if one exists."""
+        if snapshot is None:
+            serialized = None
+        else:
+            try:
+                serialized = json.dumps(
+                    snapshot,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Runtime state snapshot must be JSON serializable") from exc
+        self._runtime_state_json = serialized
+        self._rebalance()
+
     def _rebalance(self) -> None:
         self._overflow = False
         while not self._within_budget(self._compose_messages()):
@@ -84,13 +103,25 @@ class ConversationContext:
             self._removed_messages += len(removed)
 
     def _compose_messages(self) -> list[Message]:
-        messages = [self._system_message]
+        messages = [self._composed_system_message()]
         if self._removed_cycles or self._overflow:
             messages.append(self._notice_message())
         messages.append(self._task_message)
         for cycle in self._cycles:
             messages.extend(cycle)
         return messages
+
+    def _composed_system_message(self) -> Message:
+        if self._runtime_state_json is None:
+            return self._system_message
+        return {
+            "role": "system",
+            "content": (
+                self._system_message["content"]
+                + _RUNTIME_STATE_SEPARATOR
+                + self._runtime_state_json
+            ),
+        }
 
     def _notice_message(self) -> Message:
         metadata = {

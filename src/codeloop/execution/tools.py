@@ -343,6 +343,11 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [definition.schema for definition in self._tools.values()]
 
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Expose registered names for narrow cross-layer collision checks."""
+        return tuple(self._tools)
+
     def dispatch(self, name: str, arguments_json: str) -> ToolResult:
         definition = self._tools.get(name)
         if definition is None:

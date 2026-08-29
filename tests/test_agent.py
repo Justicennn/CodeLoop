@@ -4,19 +4,30 @@ import json
 import sys
 import time
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from shutil import copytree
 from typing import Any
 
 import pytest
+from rich.console import Console
 
-import codeloop.agent as agent_module
-from codeloop.agent import AgentRunner, ToolEvent, _FailureTracker
-from codeloop.cli import _show_agent_result, _show_tool_event
-from codeloop.context import ConversationContext
-from codeloop.llm import ModelAPIError, ModelResponse, ToolCall
-from codeloop.tools import MAX_TEXT_CHARS, ToolRegistry
-from codeloop.workspace import Workspace, WorkspaceError
+import codeloop.agent.runner as agent_module
+from codeloop.agent.context import ConversationContext
+from codeloop.agent.events import ToolEvent
+from codeloop.agent.runner import AgentRunner, _FailureTracker
+from codeloop.execution.tools import MAX_TEXT_CHARS, ToolRegistry
+from codeloop.execution.workspace import Workspace, WorkspaceError
+from codeloop.interaction.console import (
+    DIFF_PREVIEW_CHARS,
+    DIFF_TRUNCATION_MARKER,
+    FAILURE_EVIDENCE_CHARS,
+    OUTPUT_TRUNCATION_MARKER,
+    SUCCESS_EVIDENCE_CHARS,
+    ConsoleRenderer,
+    _bounded_text,
+)
+from codeloop.model.client import ModelAPIError, ModelResponse, ToolCall
 
 
 class FakeClient:
@@ -224,7 +235,16 @@ def test_real_tool_agent_loop_returns_observation_to_model(
     )
     registry = ToolRegistry(Workspace(tmp_path))
 
-    result = AgentRunner(client, tools=registry).run("Read sample.txt.")
+    def broken_presentation(*_args: object) -> None:
+        raise RuntimeError("presentation failed")
+
+    result = AgentRunner(
+        client,
+        tools=registry,
+        on_tool_event=broken_presentation,
+        on_model_request_started=broken_presentation,
+        on_model_request_finished=broken_presentation,
+    ).run("Read sample.txt.")
 
     assert result.status == "completed"
     assert result.answer == "The file says hello."
@@ -538,7 +558,6 @@ def test_failure_tracker_resets_on_every_required_change() -> None:
 
 def test_failure_observation_repair_verify_loop(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     template = (
         Path(__file__).parents[1] / "demo" / "discount_calculator"
@@ -553,21 +572,35 @@ def test_failure_observation_repair_verify_loop(
             ModelResponse(
                 tool_calls=[
                     ToolCall(
+                        id="browse",
+                        name="list_files",
+                        arguments="{}",
+                    ),
+                    ToolCall(
+                        id="inspect",
+                        name="read_file",
+                        arguments='{"path":"discount.py"}',
+                    ),
+                    ToolCall(
+                        id="inspect-tests",
+                        name="read_file",
+                        arguments='{"path":"test_discount.py"}',
+                    ),
+                    ToolCall(
+                        id="inspect-readme",
+                        name="read_file",
+                        arguments='{"path":"README.md"}',
+                    ),
+                ],
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
                         id="baseline",
                         name="run_command",
                         arguments=verify_arguments,
                     )
                 ]
-            ),
-            ModelResponse(
-                text="The failing assertion points to the discount calculation.",
-                tool_calls=[
-                    ToolCall(
-                        id="inspect",
-                        name="read_file",
-                        arguments='{"path":"discount.py"}',
-                    )
-                ],
             ),
             ModelResponse(
                 text="The percentage must be divided by 100.",
@@ -603,19 +636,39 @@ def test_failure_observation_repair_verify_loop(
                 text=(
                     "Changed discount.py to apply percentage discounts correctly. "
                     "Ran python -m unittest -v; all tests passed. "
-                    "No known limitations for the requested fix."
+                    "No known limitations for the requested fix.\n\n"
+                    "Inline example: `discounted_total(100, 10)`.\n\n"
+                    "```python\n"
+                    "print('theme neutral')\n"
+                    "```"
                 )
             ),
         ]
     )
     registry = ToolRegistry(Workspace(workspace_path))
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=4_000,
+        )
+    )
+    renderer.show_header(
+        "test-model",
+        workspace_path,
+        "Repair the discount calculator and verify it.",
+    )
 
     result = AgentRunner(
         client,
         tools=registry,
-        on_tool_event=_show_tool_event,
+        on_tool_event=renderer.show_tool_event,
+        on_model_request_started=renderer.start_thinking,
+        on_model_request_finished=renderer.stop_thinking,
     ).run("Repair the discount calculator and verify it.")
-    _show_agent_result(result)
+    renderer.show_result(result)
 
     assert result.status == "completed"
     assert result.steps == 5
@@ -624,13 +677,14 @@ def test_failure_observation_repair_verify_loop(
     assert "python -m unittest -v" in result.answer
     assert "all tests passed" in result.answer
     assert "limitations" in result.answer
-    baseline = json.loads(client.calls[1]["messages"][-1]["content"])
-    inspection = json.loads(client.calls[2]["messages"][-1]["content"])
+    inspection = json.loads(client.calls[1]["messages"][-3]["content"])
+    baseline = json.loads(client.calls[2]["messages"][-1]["content"])
     repair = json.loads(client.calls[3]["messages"][-1]["content"])
     verification = json.loads(client.calls[4]["messages"][-1]["content"])
     assert baseline["error_code"] == "command_failed"
     assert baseline["data"]["exit_code"] != 0
     assert "FAILED" in baseline["data"]["stderr"]
+    assert "Traceback" in baseline["data"]["stderr"]
     assert inspection["ok"] is True
     assert "discount_amount" in inspection["data"]["content"]
     assert repair["ok"] is True
@@ -639,16 +693,86 @@ def test_failure_observation_repair_verify_loop(
     assert "discount_percent / 100" in (
         workspace_path / "discount.py"
     ).read_text(encoding="utf-8")
-    output = capsys.readouterr().out
-    assert "status=error error_code=command_failed" in output
-    assert "status=ok exit_code=0" in output
-    assert "dispatch_duration_ms=" in output
-    assert "truncated=false" in output
-    assert "[observation]" in output
-    assert "[termination] status=completed steps=5" in output
+    output = rendered.getvalue()
+    assert "CodeLoop · test-model" in output
+    assert str(workspace_path) in output
+    assert "Workspace:" not in output
+    assert output.count("● Files") == 1
+    assert output.index("discount.py") < output.index("README.md")
+    assert output.index("README.md") < output.index("test_discount.py")
+    assert "Reading discount.py" not in output
+    assert "Running command" not in output
+    assert "FAILED" in output
+    assert "AssertionError" in output
+    assert "Traceback" not in output
+    assert 'File "' not in output
+    assert "OK" in output
+    assert "◆ discount.py" in output
+    assert "-discount_amount = subtotal * discount_percent" in output
+    assert "+discount_amount = subtotal * (discount_percent / 100)" in output
+    assert "--- a/discount.py" not in output
+    assert "+++ b/discount.py" not in output
+    assert "@@" not in output
+    assert "Applied 1 replacement" not in output
+    assert "Done · 5 steps" in output
     assert "Changed discount.py" in output
+    assert "Last command" not in output
+    assert "Last successful command" not in output
+    assert "unittest -v" in output
+    assert "Final answer" not in output
+    assert "discounted_total(100, 10)" in output
+    assert "print('theme neutral')" in output
+    separator_lines = [
+        line
+        for line in output.splitlines()
+        if line and set(line) == {"─"}
+    ]
+    assert separator_lines == ["─" * 80]
+    assert "[observation]" not in output
+    assert "dispatch_duration_ms=" not in output
+    assert "ms)" not in output
+    assert '"ok":' not in output
+    assert "baseline" not in output
+    assert "Diagnosing" not in output
+    assert "Planning" not in output
+    assert "Running tests" not in output
 
-    _show_tool_event(
+    rendered.seek(0)
+    rendered.truncate(0)
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="many-files",
+                name="list_files",
+                arguments="{}",
+            ),
+            result={
+                "ok": True,
+                "data": {
+                    "entries": [
+                        {"path": f"file_{index}.py", "type": "file"}
+                        for index in range(6)
+                    ]
+                    + [{"path": "ignored", "type": "directory"}],
+                },
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="duplicate-read",
+                name="read_file",
+                arguments='{"path":"file_0.py"}',
+            ),
+            result={"ok": True, "data": {"path": "file_0.py"}},
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
         ToolEvent(
             tool_call=ToolCall(
                 id="long-success",
@@ -657,13 +781,18 @@ def test_failure_observation_repair_verify_loop(
             ),
             result={
                 "ok": True,
-                "data": {"exit_code": 0, "stdout": "PASS " + "x" * 600},
+                "data": {
+                    "command": ["python", "check.py"],
+                    "exit_code": 0,
+                    "stdout": "progress " + "x" * 600,
+                    "stderr": "Ran 2 tests\nOK",
+                },
             },
             dispatch_duration_ms=7,
             truncated=False,
         )
     )
-    _show_tool_event(
+    renderer.show_tool_event(
         ToolEvent(
             tool_call=ToolCall(
                 id="long-failure",
@@ -674,23 +803,139 @@ def test_failure_observation_repair_verify_loop(
                 "ok": False,
                 "error_code": "command_failed",
                 "message": "Verification failed.",
-                "data": {"exit_code": 1, "stderr": "e" * 2_500},
+                "data": {
+                    "command": ["python", "check.py"],
+                    "exit_code": 1,
+                    "stderr": (
+                        "test_demo (tests.Demo.test_demo) ... FAIL\n"
+                        "========================================\n"
+                        "FAIL: test_demo (tests.Demo.test_demo)\n"
+                        "Traceback (most recent call last):\n"
+                        "  File \"test_demo.py\", line 3, in test_demo\n"
+                        "    self.assertEqual(1, 2)\n"
+                        "AssertionError: 1 != 2\n"
+                        "Ran 1 test in 0.001s\n"
+                        "FAILED (failures=1)"
+                    ),
+                },
             },
             dispatch_duration_ms=8,
             truncated=False,
         )
     )
-    bounded_output = capsys.readouterr().out.splitlines()
-    stdout_line = next(
-        line for line in bounded_output if line.startswith("[stdout] ")
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="generic-success",
+                name="run_command",
+                arguments="{}",
+            ),
+            result={
+                "ok": True,
+                "data": {
+                    "command": ["tool", "build"],
+                    "exit_code": 0,
+                    "stdout": "fallback-one\nfallback-two\nfallback-three\nfallback-four",
+                    "stderr": "",
+                },
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
     )
-    observation_line = next(
-        line for line in bounded_output if line.startswith("[observation] ")
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="invalid-command",
+                name="run_command",
+                arguments='{"command":"python check.py"}',
+            ),
+            result={
+                "ok": False,
+                "error_code": "invalid_arguments",
+                "message": "command must be a non-empty array of strings",
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
     )
-    assert len(stdout_line.removeprefix("[stdout] ")) <= 500
-    assert len(observation_line.removeprefix("[observation] ")) <= 2_000
-    assert stdout_line.endswith("[display truncated]")
-    assert observation_line.endswith("[display truncated]")
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="long-edit",
+                name="edit_file",
+                arguments=json.dumps(
+                    {
+                        "path": "large.py",
+                        "old_text": "old_" + "a" * 2_000,
+                        "new_text": "new_" + "b" * 2_000,
+                    }
+                ),
+            ),
+            result={
+                "ok": True,
+                "data": {"path": "large.py", "replacements": 1},
+            },
+            dispatch_duration_ms=1_200,
+            truncated=False,
+        )
+    )
+    bounded_output = rendered.getvalue()
+    assert bounded_output.count("● Files") == 1
+    assert bounded_output.count("file_0.py") == 1
+    assert "file_4.py" in bounded_output
+    assert "file_5.py" not in bounded_output
+    assert "+1 more" in bounded_output
+    assert "Command details unavailable" not in bounded_output
+    assert "⚠ Command not executed · invalid_arguments" in bounded_output
+    assert bounded_output.count(
+        "command must be a non-empty array of strings"
+    ) == 1
+    assert all(
+        not line.strip().startswith("Error:")
+        for line in bounded_output.splitlines()
+    )
+    assert "Ran 2 tests" in bounded_output
+    assert "OK" in bounded_output
+    assert "progress " not in bounded_output
+    assert "python check.py" in bounded_output
+    assert "test_demo (tests.Demo.test_demo) ... FAIL" in bounded_output
+    assert "AssertionError: 1 != 2" in bounded_output
+    assert "FAILED (failures=1)" in bounded_output
+    assert "Traceback" not in bounded_output
+    assert 'File "test_demo.py"' not in bounded_output
+    assert "FAIL: test_demo" not in bounded_output
+    assert "fallback-one" not in bounded_output
+    assert "fallback-two" in bounded_output
+    assert "fallback-three" in bounded_output
+    assert "fallback-four" in bounded_output
+    assert "... diff truncated ..." in bounded_output
+    assert "---" not in bounded_output
+    assert "+++" not in bounded_output
+    assert "@@" not in bounded_output
+    assert "replacements" not in bounded_output
+    assert "(1.2s)" not in bounded_output
+    assert len(
+        _bounded_text(
+            "x" * (SUCCESS_EVIDENCE_CHARS + 1),
+            SUCCESS_EVIDENCE_CHARS,
+            OUTPUT_TRUNCATION_MARKER,
+        )
+    ) == SUCCESS_EVIDENCE_CHARS
+    assert len(
+        _bounded_text(
+            "x" * (FAILURE_EVIDENCE_CHARS + 1),
+            FAILURE_EVIDENCE_CHARS,
+            OUTPUT_TRUNCATION_MARKER,
+        )
+    ) == FAILURE_EVIDENCE_CHARS
+    assert len(
+        _bounded_text(
+            "x" * (DIFF_PREVIEW_CHARS + 1),
+            DIFF_PREVIEW_CHARS,
+            DIFF_TRUNCATION_MARKER,
+        )
+    ) == DIFF_PREVIEW_CHARS
 
 
 def test_api_retry_classification_and_exhaustion(
@@ -714,54 +959,93 @@ def test_api_retry_classification_and_exhaustion(
     recovered_client = FakeClient(
         [retryable, retryable, ModelResponse(text="recovered")]
     )
+    recovered_events: list[str] = []
     recovered = AgentRunner(
         recovered_client,
         tools=registry,
+        on_model_request_started=lambda: recovered_events.append("started"),
+        on_model_request_finished=lambda: recovered_events.append("finished"),
     ).run("Retry temporary errors.")
     assert recovered.status == "completed"
     assert len(recovered_client.calls) == 3
     assert delays == [0.5, 1.0]
+    assert recovered_events == ["started", "finished"]
 
     delays.clear()
     fatal_client = FakeClient([fatal])
+    fatal_events: list[str] = []
     fatal_result = AgentRunner(
         fatal_client,
         tools=registry,
+        on_model_request_started=lambda: fatal_events.append("started"),
+        on_model_request_finished=lambda: fatal_events.append("finished"),
     ).run("Do not retry fatal errors.")
     assert fatal_result.status == "fatal_api_error"
     assert len(fatal_client.calls) == 1
     assert delays == []
+    assert fatal_events == ["started", "finished"]
 
     exhausted_client = FakeClient([retryable, retryable, retryable])
+    exhausted_events: list[str] = []
     exhausted = AgentRunner(
         exhausted_client,
         tools=registry,
+        on_model_request_started=lambda: exhausted_events.append("started"),
+        on_model_request_finished=lambda: exhausted_events.append("finished"),
     ).run("Exhaust retryable errors.")
     assert exhausted.status == "fatal_api_error"
     assert len(exhausted_client.calls) == 3
     assert delays == [0.5, 1.0]
+    assert exhausted_events == ["started", "finished"]
 
 
 def test_interrupt_runtime_error_and_base_exception_boundaries(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry(Workspace(tmp_path))
+    interrupted_events: list[str] = []
+    failed_events: list[str] = []
 
     interrupted = AgentRunner(
         FakeClient([KeyboardInterrupt()]),
         tools=registry,
+        on_model_request_started=lambda: interrupted_events.append("started"),
+        on_model_request_finished=lambda: interrupted_events.append("finished"),
     ).run("Interrupt.")
     failed = AgentRunner(
         FakeClient([ValueError("private detail")]),
         tools=registry,
+        on_model_request_started=lambda: failed_events.append("started"),
+        on_model_request_finished=lambda: failed_events.append("finished"),
     ).run("Fail internally.")
 
-    assert interrupted.status == "user_interrupt"
-    assert failed.status == "runtime_error"
-    assert "private detail" not in (failed.message or "")
+    started_interrupt_events: list[str] = []
 
+    def interrupt_while_starting() -> None:
+        started_interrupt_events.append("started")
+        raise KeyboardInterrupt()
+
+    interrupted_before_request = AgentRunner(
+        FakeClient([]),
+        tools=registry,
+        on_model_request_started=interrupt_while_starting,
+        on_model_request_finished=lambda: started_interrupt_events.append("finished"),
+    ).run("Interrupt while starting presentation.")
+
+    assert interrupted.status == "user_interrupt"
+    assert interrupted_events == ["started", "finished"]
+    assert failed.status == "runtime_error"
+    assert failed_events == ["started", "finished"]
+    assert "private detail" not in (failed.message or "")
+    assert interrupted_before_request.status == "user_interrupt"
+    assert started_interrupt_events == ["started", "finished"]
+
+    system_exit_events: list[str] = []
     with pytest.raises(SystemExit):
         AgentRunner(
             FakeClient([SystemExit(7)]),
             tools=registry,
+            on_model_request_started=lambda: system_exit_events.append("started"),
+            on_model_request_finished=lambda: system_exit_events.append("finished"),
         ).run("Do not catch BaseException.")
+    assert system_exit_events == ["started", "finished"]

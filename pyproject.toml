@@ -9,6 +9,7 @@ description = "A small, self-built local coding-agent runtime."
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0,<3",
+    "rich>=14,<16",
 ]
 
 [project.optional-dependencies]

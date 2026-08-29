@@ -4,23 +4,26 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from time import perf_counter, sleep
 from typing import Any, Literal
 
+from ..execution.tools import ToolRegistry, ToolResult
+from ..model.client import ModelAPIError, ModelClient, ModelResponse, ToolCall
 from .context import (
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_MAX_CONTEXT_MESSAGES,
     ConversationContext,
 )
-from .llm import ModelAPIError, ModelClient, ModelResponse, ToolCall
-from .tools import ToolRegistry, ToolResult
-
-SYSTEM_PROMPT = """You are an agent that can use tools to interact with a local runtime.
-For coding tasks, inspect the relevant existing files and establish a baseline before editing when practical.
-Use tool and command failures as evidence: diagnose them, make a focused repair, and run relevant verification after changes.
-Never pretend a tool or check ran, and never claim success that the observations do not support.
-In the final answer, honestly name changed files, verification commands and results, and any known limitations."""
+from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
+from .plan import (
+    UPDATE_PLAN_ACTION_NAME,
+    UPDATE_PLAN_SCHEMA,
+    apply_plan_action,
+)
+from .prompt import SYSTEM_PROMPT
+from .task_state import TaskState
 
 TerminationReason = Literal[
     "completed",
@@ -43,19 +46,8 @@ class AgentResult:
     message: str | None = None
 
 
-@dataclass(frozen=True)
-class ToolEvent:
-    tool_call: ToolCall
-    result: ToolResult
-    dispatch_duration_ms: int
-    truncated: bool
-
-
-ToolEventHandler = Callable[[ToolEvent], None]
-
-
 class _FailureTracker:
-    """Track only consecutive, identical failed tool calls."""
+    """Track only consecutive, identical failed action/tool calls."""
 
     def __init__(self) -> None:
         self._fingerprint: str | None = None
@@ -112,6 +104,8 @@ class AgentRunner:
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
         on_tool_event: ToolEventHandler | None = None,
+        on_model_request_started: ModelRequestHandler | None = None,
+        on_model_request_finished: ModelRequestHandler | None = None,
     ) -> None:
         if max_steps < 1 or max_steps > MAX_CONFIGURED_STEPS:
             raise ValueError(
@@ -123,6 +117,18 @@ class AgentRunner:
         self._max_context_chars = max_context_chars
         self._max_context_messages = max_context_messages
         self._on_tool_event = on_tool_event
+        self._on_model_request_started = on_model_request_started
+        self._on_model_request_finished = on_model_request_finished
+        execution_schemas = self._tools.schemas
+        if UPDATE_PLAN_ACTION_NAME in self._tools.names or any(
+            schema.get("function", {}).get("name") == UPDATE_PLAN_ACTION_NAME
+            for schema in execution_schemas
+        ):
+            raise ValueError(
+                "Execution ToolRegistry cannot register reserved action: "
+                f"{UPDATE_PLAN_ACTION_NAME}"
+            )
+        self._action_schemas = [UPDATE_PLAN_SCHEMA, *execution_schemas]
 
     def run(self, task: str) -> AgentResult:
         context = ConversationContext(
@@ -131,13 +137,24 @@ class AgentRunner:
             max_chars=self._max_context_chars,
             max_messages=self._max_context_messages,
         )
+        task_state = TaskState()
         failures = _FailureTracker()
         current_step = 0
 
         try:
             for step in range(1, self._max_steps + 1):
                 current_step = step
-                response = self._request_model(context.messages_for_model())
+                try:
+                    _notify_presentation(self._on_model_request_started)
+                    context.set_runtime_state(task_state.snapshot_for_model())
+                    prepared_messages = context.messages_for_model()
+                    prepared_action_schemas = deepcopy(self._action_schemas)
+                    response = self._request_model(
+                        prepared_messages,
+                        prepared_action_schemas,
+                    )
+                finally:
+                    _notify_presentation(self._on_model_request_finished)
 
                 if not response.tool_calls:
                     return AgentResult(
@@ -153,10 +170,13 @@ class AgentRunner:
                 tool_messages: list[dict[str, Any]] = []
                 for tool_call in response.tool_calls:
                     dispatch_started = perf_counter()
-                    result = self._tools.dispatch(
-                        tool_call.name,
-                        tool_call.arguments,
-                    )
+                    if tool_call.name == UPDATE_PLAN_ACTION_NAME:
+                        result = apply_plan_action(task_state, tool_call.arguments)
+                    else:
+                        result = self._tools.dispatch(
+                            tool_call.name,
+                            tool_call.arguments,
+                        )
                     dispatch_duration_ms = max(
                         0,
                         round((perf_counter() - dispatch_started) * 1000),
@@ -169,8 +189,12 @@ class AgentRunner:
                             "content": json.dumps(result, ensure_ascii=False),
                         }
                     )
-                    if self._on_tool_event is not None:
-                        self._on_tool_event(
+                    if (
+                        tool_call.name != UPDATE_PLAN_ACTION_NAME
+                        and self._on_tool_event is not None
+                    ):
+                        _notify_presentation(
+                            self._on_tool_event,
                             ToolEvent(
                                 tool_call=tool_call,
                                 result=result,
@@ -184,7 +208,7 @@ class AgentRunner:
                             answer=None,
                             steps=step,
                             message=(
-                                "Three consecutive identical tool failures "
+                                "Three consecutive identical action failures "
                                 f"occurred for {tool_call.name}."
                             ),
                         )
@@ -221,10 +245,14 @@ class AgentRunner:
     def _request_model(
         self,
         messages: list[dict[str, Any]],
+        action_schemas: list[dict[str, Any]],
     ) -> ModelResponse:
         for attempt in range(MODEL_REQUEST_ATTEMPTS):
             try:
-                return self._client.complete(messages, self._tools.schemas)
+                return self._client.complete(
+                    deepcopy(messages),
+                    deepcopy(action_schemas),
+                )
             except ModelAPIError as exc:
                 if exc.classification == "fatal":
                     raise
@@ -267,3 +295,15 @@ def _tool_result_is_truncated(result: ToolResult) -> bool:
         data.get(field) is True
         for field in ("truncated", "stdout_truncated", "stderr_truncated")
     )
+
+
+def _notify_presentation(
+    callback: Callable[..., None] | None,
+    *args: object,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        pass
