@@ -18,12 +18,14 @@ from .context import (
 )
 from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
 from .plan import (
+    PlanStep,
     UPDATE_PLAN_ACTION_NAME,
     UPDATE_PLAN_SCHEMA,
     apply_plan_action,
 )
 from .prompt import SYSTEM_PROMPT
-from .task_state import TaskState
+from .task_state import PlanOutcome, TaskState
+from .verification import VerificationAttempt, VerificationStatus
 
 TerminationReason = Literal[
     "completed",
@@ -40,10 +42,25 @@ MAX_CONFIGURED_STEPS = 100
 
 @dataclass(frozen=True)
 class AgentResult:
+    """Termination plus orthogonal Plan and managed-revision verification facts.
+
+    ``verification_status == "verified"`` means only that the latest
+    run_command attempt for the current CodeLoop-managed revision succeeded.
+    Command relevance, semantic correctness, and run_command filesystem side
+    effects remain outside this result's guarantees.
+    """
+
     status: TerminationReason
     answer: str | None
     steps: int
     message: str | None = None
+    verification_status: VerificationStatus = "not_required"
+    workspace_revision: int = 0
+    verified_revision: int | None = None
+    last_verification: VerificationAttempt | None = None
+    plan_status: PlanOutcome = "not_planned"
+    unfinished_steps: tuple[PlanStep, ...] = ()
+    blocked_steps: tuple[PlanStep, ...] = ()
 
 
 class _FailureTracker:
@@ -147,6 +164,7 @@ class AgentRunner:
                 try:
                     _notify_presentation(self._on_model_request_started)
                     context.set_runtime_state(task_state.snapshot_for_model())
+                    task_state.clear_pending_completion_review()
                     prepared_messages = context.messages_for_model()
                     prepared_action_schemas = deepcopy(self._action_schemas)
                     response = self._request_model(
@@ -157,7 +175,13 @@ class AgentRunner:
                     _notify_presentation(self._on_model_request_finished)
 
                 if not response.tool_calls:
-                    return AgentResult(
+                    if (
+                        step < self._max_steps
+                        and task_state.request_completion_review()
+                    ):
+                        continue
+                    return self._result(
+                        task_state,
                         status="completed",
                         answer=response.text or "",
                         steps=step,
@@ -182,6 +206,11 @@ class AgentRunner:
                             result,
                         ):
                             task_state.record_workspace_change()
+                        if tool_call.name == "run_command":
+                            task_state.record_run_command(
+                                model_step=step,
+                                result=result,
+                            )
                     dispatch_duration_ms = max(
                         0,
                         round((perf_counter() - dispatch_started) * 1000),
@@ -208,7 +237,8 @@ class AgentRunner:
                             )
                         )
                     if failures.record(tool_call, result):
-                        return AgentResult(
+                        return self._result(
+                            task_state,
                             status="repeated_failure",
                             answer=None,
                             steps=step,
@@ -219,33 +249,60 @@ class AgentRunner:
                         )
                 context.add_tool_cycle(assistant_message, tool_messages)
 
-            return AgentResult(
+            return self._result(
+                task_state,
                 status="max_steps",
                 answer=None,
                 steps=self._max_steps,
                 message=f"Maximum model decisions reached: {self._max_steps}.",
             )
         except KeyboardInterrupt:
-            return AgentResult(
+            return self._result(
+                task_state,
                 status="user_interrupt",
                 answer=None,
                 steps=current_step,
                 message="The run was interrupted by the user.",
             )
         except ModelAPIError as exc:
-            return AgentResult(
+            return self._result(
+                task_state,
                 status="fatal_api_error",
                 answer=None,
                 steps=current_step,
                 message=exc.safe_message,
             )
         except Exception:
-            return AgentResult(
+            return self._result(
+                task_state,
                 status="runtime_error",
                 answer=None,
                 steps=current_step,
                 message="An unexpected internal runtime error occurred.",
             )
+
+    @staticmethod
+    def _result(
+        task_state: TaskState,
+        *,
+        status: TerminationReason,
+        answer: str | None,
+        steps: int,
+        message: str | None = None,
+    ) -> AgentResult:
+        return AgentResult(
+            status=status,
+            answer=answer,
+            steps=steps,
+            message=message,
+            verification_status=task_state.verification_status,
+            workspace_revision=task_state.workspace_revision,
+            verified_revision=task_state.verified_revision,
+            last_verification=task_state.verification.last_attempt,
+            plan_status=task_state.plan_status,
+            unfinished_steps=task_state.unfinished_steps,
+            blocked_steps=task_state.blocked_steps,
+        )
 
     def _request_model(
         self,

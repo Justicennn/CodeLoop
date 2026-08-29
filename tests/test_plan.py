@@ -418,6 +418,37 @@ def test_plan_guided_react_preserves_multi_action_cycles(
     assert len(schema_names) == 8
 
 
+def test_agent_result_exposes_blocked_plan_facts(tmp_path: Path) -> None:
+    blocked = _action(
+        "create",
+        [
+            _step(
+                "blocked-step",
+                "Use an unavailable external service",
+                "blocked",
+                blocked_reason="The required service is unavailable.",
+            )
+        ],
+    )
+    client = FakeClient(
+        [
+            ModelResponse(tool_calls=[_tool_call("plan-blocked", blocked)]),
+            ModelResponse(text="Cannot continue without the service."),
+        ]
+    )
+
+    result = AgentRunner(
+        client,
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("Use the required service.")
+
+    assert result.status == "completed"
+    assert result.plan_status == "terminal_with_blocks"
+    assert result.unfinished_steps == ()
+    assert [step.id for step in result.blocked_steps] == ["blocked-step"]
+    assert result.verification_status == "not_required"
+
+
 def test_plan_snapshot_and_schemas_are_stable_across_api_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -437,6 +468,7 @@ def test_plan_snapshot_and_schemas_are_stable_across_api_retry(
             temporary,
             temporary,
             ModelResponse(text="Recovered."),
+            ModelResponse(text="Accepted with unfinished plan work."),
         ]
     )
     delays: list[float] = []
@@ -449,9 +481,10 @@ def test_plan_snapshot_and_schemas_are_stable_across_api_retry(
 
     assert result.status == "completed"
     assert delays == [0.5, 1.0]
-    retry_calls = client.calls[1:]
+    retry_calls = client.calls[1:4]
     assert retry_calls[0] == retry_calls[1] == retry_calls[2]
     assert '"revision":1' in retry_calls[0]["messages"][0]["content"]
+    assert "completion_review" in client.calls[4]["messages"][0]["content"]
 
 
 def test_identical_update_plan_failures_use_existing_termination(

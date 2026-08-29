@@ -411,7 +411,11 @@ def test_runner_keeps_plan_and_workspace_revisions_independent(
         ToolCall(id="read", name="read_file", arguments='{"path":"src/app.txt"}'),
     ]
     client = FakeClient(
-        [ModelResponse(tool_calls=calls), ModelResponse(text="done")]
+        [
+            ModelResponse(tool_calls=calls),
+            ModelResponse(text="first incomplete final"),
+            ModelResponse(text="done"),
+        ]
     )
 
     result = AgentRunner(
@@ -423,6 +427,8 @@ def test_runner_keeps_plan_and_workspace_revisions_independent(
     assert state.plan is not None
     assert state.plan.revision == 1
     assert state.workspace_revision == 3
+    assert result.verification_status == "unverified"
+    assert result.plan_status == "active"
     observations = client.calls[1]["messages"][-5:]
     assert [message["tool_call_id"] for message in observations] == [
         "plan",
@@ -475,7 +481,9 @@ def test_partial_failure_increments_revision_and_still_repeats(
 
     assert result.status == "repeated_failure"
     assert state.workspace_revision == 1
+    assert result.verification_status == "unverified"
     first_observation = json.loads(client.calls[1]["messages"][-1]["content"])
     assert first_observation["ok"] is False
     assert first_observation["data"]["workspace_changed"] is True
     assert first_observation["data"]["created_directories"] == ["src"]
+
