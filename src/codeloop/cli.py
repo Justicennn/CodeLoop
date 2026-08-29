@@ -8,10 +8,27 @@ import os
 import sys
 from pathlib import Path
 
-from .agent import AgentRunner, MAX_CONFIGURED_STEPS, TerminationReason
-from .llm import OpenAICompatibleClient, ToolCall
-from .tools import ToolRegistry, ToolResult
+from .agent import (
+    AgentResult,
+    AgentRunner,
+    MAX_CONFIGURED_STEPS,
+    TerminationReason,
+    ToolEvent,
+)
+from .context import (
+    DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_CONTEXT_MESSAGES,
+    MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_MESSAGES,
+    MIN_CONTEXT_CHARS,
+    MIN_CONTEXT_MESSAGES,
+)
+from .llm import OpenAICompatibleClient
+from .tools import ToolRegistry
 from .workspace import Workspace, WorkspaceError
+
+FAILURE_OBSERVATION_CHARS = 2_000
+SUCCESS_STDOUT_CHARS = 500
 
 EXIT_CODES: dict[TerminationReason, int] = {
     "completed": 0,
@@ -23,19 +40,98 @@ EXIT_CODES: dict[TerminationReason, int] = {
 }
 
 
-def _show_tool_event(tool_call: ToolCall, result: ToolResult) -> None:
-    print(f"[tool] {tool_call.name} (id={tool_call.id})")
-    print(f"[tool result] {json.dumps(result, ensure_ascii=False)}")
+def _show_tool_event(event: ToolEvent) -> None:
+    result = event.result
+    ok = result.get("ok") is True
+    fields = [
+        f"name={event.tool_call.name}",
+        f"id={event.tool_call.id}",
+        f"status={'ok' if ok else 'error'}",
+    ]
+    error_code = result.get("error_code")
+    if isinstance(error_code, str):
+        fields.append(f"error_code={error_code}")
+    data = result.get("data")
+    if isinstance(data, dict) and data.get("exit_code") is not None:
+        fields.append(f"exit_code={data['exit_code']}")
+    fields.extend(
+        (
+            f"dispatch_duration_ms={event.dispatch_duration_ms}",
+            f"truncated={str(event.truncated).lower()}",
+        )
+    )
+    print(f"[tool] {' '.join(fields)}")
+
+    if not ok:
+        _show_excerpt(
+            "[observation]",
+            json.dumps(result, ensure_ascii=False),
+            FAILURE_OBSERVATION_CHARS,
+        )
+    elif event.tool_call.name == "run_command" and isinstance(data, dict):
+        stdout = data.get("stdout")
+        if isinstance(stdout, str) and stdout:
+            _show_excerpt("[stdout]", stdout, SUCCESS_STDOUT_CHARS)
+
+
+def _show_excerpt(label: str, text: str, limit: int) -> None:
+    marker = "... [display truncated]"
+    if len(text) > limit:
+        text = text[: limit - len(marker)] + marker
+    print(f"{label} {text}")
+
+
+def _show_agent_result(result: AgentResult) -> None:
+    if result.status == "completed":
+        print(f"[final] {result.answer}")
+    fields = [f"status={result.status}", f"steps={result.steps}"]
+    if result.message:
+        fields.append(f"message={result.message}")
+    output = f"[termination] {' '.join(fields)}"
+    print(output, file=sys.stdout if result.status == "completed" else sys.stderr)
 
 
 def _bounded_max_steps(value: str) -> int:
+    return _bounded_integer(
+        value,
+        name="max steps",
+        minimum=1,
+        maximum=MAX_CONFIGURED_STEPS,
+    )
+
+
+def _bounded_context_chars(value: str) -> int:
+    return _bounded_integer(
+        value,
+        name="max context chars",
+        minimum=MIN_CONTEXT_CHARS,
+        maximum=MAX_CONTEXT_CHARS,
+    )
+
+
+def _bounded_context_messages(value: str) -> int:
+    return _bounded_integer(
+        value,
+        name="max context messages",
+        minimum=MIN_CONTEXT_MESSAGES,
+        maximum=MAX_CONTEXT_MESSAGES,
+    )
+
+
+def _bounded_integer(
+    value: str,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("max steps must be an integer") from exc
-    if parsed < 1 or parsed > MAX_CONFIGURED_STEPS:
+        raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
         raise argparse.ArgumentTypeError(
-            f"max steps must be between 1 and {MAX_CONFIGURED_STEPS}"
+            f"{name} must be between {minimum} and {maximum}"
         )
     return parsed
 
@@ -49,6 +145,24 @@ def _parser() -> argparse.ArgumentParser:
         help="Workspace directory (default: current directory)",
     )
     parser.add_argument("--max-steps", type=_bounded_max_steps, default=20)
+    parser.add_argument(
+        "--max-context-chars",
+        type=_bounded_context_chars,
+        default=DEFAULT_MAX_CONTEXT_CHARS,
+        help=(
+            "Conversation-history character budget; this is not a token limit "
+            f"(default: {DEFAULT_MAX_CONTEXT_CHARS})"
+        ),
+    )
+    parser.add_argument(
+        "--max-context-messages",
+        type=_bounded_context_messages,
+        default=DEFAULT_MAX_CONTEXT_MESSAGES,
+        help=(
+            "Conversation-history message budget "
+            f"(default: {DEFAULT_MAX_CONTEXT_MESSAGES})"
+        ),
+    )
     return parser
 
 
@@ -77,6 +191,8 @@ def main() -> int:
             client,
             tools=registry,
             max_steps=args.max_steps,
+            max_context_chars=args.max_context_chars,
+            max_context_messages=args.max_context_messages,
             on_tool_event=_show_tool_event,
         ).run(args.task)
     except WorkspaceError as exc:
@@ -89,11 +205,7 @@ def main() -> int:
         print("\nInterrupted.", file=sys.stderr)
         return 130
 
-    if result.status == "completed":
-        print(f"[final] {result.answer}")
-    else:
-        detail = f": {result.message}" if result.message else ""
-        print(f"[stopped] {result.status}{detail}", file=sys.stderr)
+    _show_agent_result(result)
     return EXIT_CODES[result.status]
 
 

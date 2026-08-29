@@ -5,12 +5,15 @@ import sys
 import time
 from copy import deepcopy
 from pathlib import Path
+from shutil import copytree
 from typing import Any
 
 import pytest
 
 import codeloop.agent as agent_module
-from codeloop.agent import AgentRunner, _FailureTracker
+from codeloop.agent import AgentRunner, ToolEvent, _FailureTracker
+from codeloop.cli import _show_agent_result, _show_tool_event
+from codeloop.context import ConversationContext
 from codeloop.llm import ModelAPIError, ModelResponse, ToolCall
 from codeloop.tools import MAX_TEXT_CHARS, ToolRegistry
 from codeloop.workspace import Workspace, WorkspaceError
@@ -236,6 +239,171 @@ def test_real_tool_agent_loop_returns_observation_to_model(
     assert "1: hello" in observation["data"]["content"]
 
 
+def test_context_trims_complete_cycles_and_counts_notice_in_budgets() -> None:
+    def cycle(
+        call_id: str,
+        content: str = "ok",
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"},
+                }
+            ],
+        }
+        results = [
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": "list_files",
+                "content": content,
+            }
+        ]
+        return assistant, results
+
+    message_limited = ConversationContext(
+        "system",
+        "task",
+        max_chars=10_000,
+        max_messages=6,
+    )
+    for call_id in ("one", "two", "three"):
+        assistant, results = cycle(call_id)
+        message_limited.add_tool_cycle(assistant, results)
+
+    assistant, results = cycle("four")
+    assistant["tool_calls"].append(
+        {
+            "id": "four-b",
+            "type": "function",
+            "function": {"name": "list_files", "arguments": "{}"},
+        }
+    )
+    results.append(
+        {
+            "role": "tool",
+            "tool_call_id": "four-b",
+            "name": "list_files",
+            "content": "ok",
+        }
+    )
+    message_limited.add_tool_cycle(assistant, results)
+    messages = message_limited.messages_for_model()
+
+    assert len(messages) == 6
+    assert messages[0] == {"role": "system", "content": "system"}
+    assert messages[2] == {"role": "user", "content": "task"}
+    notice = json.loads(messages[1]["content"].split(": ", 1)[1])
+    assert notice == {
+        "conversation_history_trimmed": True,
+        "guidance": "Older tool evidence is unavailable; re-read files if needed.",
+        "overflow": False,
+        "removed_cycles": 3,
+        "removed_messages": 6,
+    }
+    declared_ids = [
+        call["id"]
+        for message in messages
+        if message["role"] == "assistant"
+        for call in message["tool_calls"]
+    ]
+    result_ids = [
+        message["tool_call_id"]
+        for message in messages
+        if message["role"] == "tool"
+    ]
+    assert declared_ids == ["four", "four-b"]
+    assert result_ids == declared_ids
+
+    large_cycles = [cycle(call_id, "x" * 400) for call_id in ("a", "b", "c")]
+    two_cycle_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+    ]
+    for assistant, results in large_cycles[:2]:
+        two_cycle_messages.extend([assistant, *results])
+    char_budget = len(
+        json.dumps(
+            two_cycle_messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    character_limited = ConversationContext(
+        "system",
+        "task",
+        max_chars=char_budget,
+        max_messages=20,
+    )
+    for assistant, results in large_cycles:
+        character_limited.add_tool_cycle(assistant, results)
+    char_messages = character_limited.messages_for_model()
+    retained_ids = [
+        message["tool_call_id"]
+        for message in char_messages
+        if message["role"] == "tool"
+    ]
+    serialized_chars = len(
+        json.dumps(
+            char_messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    assert retained_ids == ["c"]
+    assert serialized_chars <= char_budget
+
+
+def test_oversized_latest_cycle_is_preserved_for_fake_client(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "large.txt").write_text("x" * 2_000, encoding="utf-8")
+    client = FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="large-read",
+                        name="read_file",
+                        arguments='{"path":"large.txt"}',
+                    )
+                ]
+            ),
+            ModelResponse(text="Observed the large file."),
+        ]
+    )
+    registry = ToolRegistry(Workspace(tmp_path))
+
+    result = AgentRunner(
+        client,
+        tools=registry,
+        max_context_chars=1_000,
+        max_context_messages=10,
+    ).run("Read the large file.")
+
+    assert result.status == "completed"
+    messages = client.calls[1]["messages"]
+    notice = json.loads(messages[1]["content"].split(": ", 1)[1])
+    assert notice["conversation_history_trimmed"] is False
+    assert notice["overflow"] is True
+    assert len(
+        json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    ) > 1_000
+    assert messages[-2]["tool_calls"][0]["id"] == "large-read"
+    assert messages[-1]["tool_call_id"] == "large-read"
+
+
 def test_max_steps_remains_an_independent_limit(tmp_path: Path) -> None:
     repeated_call = ModelResponse(
         tool_calls=[
@@ -335,7 +503,7 @@ def test_repeated_failure_stops_before_remaining_tool_calls(
     result = AgentRunner(
         client,
         tools=registry,
-        on_tool_event=lambda call, _: events.append(call.id),
+        on_tool_event=lambda event: events.append(event.tool_call.id),
     ).run("Repeat a failing call.")
 
     assert result.status == "repeated_failure"
@@ -366,6 +534,163 @@ def test_failure_tracker_resets_on_every_required_change() -> None:
     assert tracker.record(changed_arguments, failed_b) is False
     assert tracker.record(changed_arguments, failed_b) is False
     assert tracker.record(changed_arguments, failed_b) is True
+
+
+def test_failure_observation_repair_verify_loop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    template = (
+        Path(__file__).parents[1] / "demo" / "discount_calculator"
+    )
+    workspace_path = tmp_path / "discount_calculator"
+    copytree(template, workspace_path)
+    verify_arguments = json.dumps(
+        {"command": [sys.executable, "-m", "unittest", "-v"]}
+    )
+    client = FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="baseline",
+                        name="run_command",
+                        arguments=verify_arguments,
+                    )
+                ]
+            ),
+            ModelResponse(
+                text="The failing assertion points to the discount calculation.",
+                tool_calls=[
+                    ToolCall(
+                        id="inspect",
+                        name="read_file",
+                        arguments='{"path":"discount.py"}',
+                    )
+                ],
+            ),
+            ModelResponse(
+                text="The percentage must be divided by 100.",
+                tool_calls=[
+                    ToolCall(
+                        id="repair",
+                        name="edit_file",
+                        arguments=json.dumps(
+                            {
+                                "path": "discount.py",
+                                "old_text": (
+                                    "discount_amount = subtotal * discount_percent"
+                                ),
+                                "new_text": (
+                                    "discount_amount = subtotal * "
+                                    "(discount_percent / 100)"
+                                ),
+                            }
+                        ),
+                    )
+                ],
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="verify",
+                        name="run_command",
+                        arguments=verify_arguments,
+                    )
+                ]
+            ),
+            ModelResponse(
+                text=(
+                    "Changed discount.py to apply percentage discounts correctly. "
+                    "Ran python -m unittest -v; all tests passed. "
+                    "No known limitations for the requested fix."
+                )
+            ),
+        ]
+    )
+    registry = ToolRegistry(Workspace(workspace_path))
+
+    result = AgentRunner(
+        client,
+        tools=registry,
+        on_tool_event=_show_tool_event,
+    ).run("Repair the discount calculator and verify it.")
+    _show_agent_result(result)
+
+    assert result.status == "completed"
+    assert result.steps == 5
+    assert result.answer is not None
+    assert "discount.py" in result.answer
+    assert "python -m unittest -v" in result.answer
+    assert "all tests passed" in result.answer
+    assert "limitations" in result.answer
+    baseline = json.loads(client.calls[1]["messages"][-1]["content"])
+    inspection = json.loads(client.calls[2]["messages"][-1]["content"])
+    repair = json.loads(client.calls[3]["messages"][-1]["content"])
+    verification = json.loads(client.calls[4]["messages"][-1]["content"])
+    assert baseline["error_code"] == "command_failed"
+    assert baseline["data"]["exit_code"] != 0
+    assert "FAILED" in baseline["data"]["stderr"]
+    assert inspection["ok"] is True
+    assert "discount_amount" in inspection["data"]["content"]
+    assert repair["ok"] is True
+    assert verification["ok"] is True
+    assert verification["data"]["exit_code"] == 0
+    assert "discount_percent / 100" in (
+        workspace_path / "discount.py"
+    ).read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert "status=error error_code=command_failed" in output
+    assert "status=ok exit_code=0" in output
+    assert "dispatch_duration_ms=" in output
+    assert "truncated=false" in output
+    assert "[observation]" in output
+    assert "[termination] status=completed steps=5" in output
+    assert "Changed discount.py" in output
+
+    _show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="long-success",
+                name="run_command",
+                arguments="{}",
+            ),
+            result={
+                "ok": True,
+                "data": {"exit_code": 0, "stdout": "PASS " + "x" * 600},
+            },
+            dispatch_duration_ms=7,
+            truncated=False,
+        )
+    )
+    _show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="long-failure",
+                name="run_command",
+                arguments="{}",
+            ),
+            result={
+                "ok": False,
+                "error_code": "command_failed",
+                "message": "Verification failed.",
+                "data": {"exit_code": 1, "stderr": "e" * 2_500},
+            },
+            dispatch_duration_ms=8,
+            truncated=False,
+        )
+    )
+    bounded_output = capsys.readouterr().out.splitlines()
+    stdout_line = next(
+        line for line in bounded_output if line.startswith("[stdout] ")
+    )
+    observation_line = next(
+        line for line in bounded_output if line.startswith("[observation] ")
+    )
+    assert len(stdout_line.removeprefix("[stdout] ")) <= 500
+    assert len(observation_line.removeprefix("[observation] ")) <= 2_000
+    assert stdout_line.endswith("[display truncated]")
+    assert observation_line.endswith("[display truncated]")
 
 
 def test_api_retry_classification_and_exhaustion(

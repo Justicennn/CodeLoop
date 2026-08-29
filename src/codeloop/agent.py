@@ -5,15 +5,22 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any, Literal
 
+from .context import (
+    DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_CONTEXT_MESSAGES,
+    ConversationContext,
+)
 from .llm import ModelAPIError, ModelClient, ModelResponse, ToolCall
 from .tools import ToolRegistry, ToolResult
 
 SYSTEM_PROMPT = """You are an agent that can use tools to interact with a local runtime.
-Use a tool when it helps complete the user's task. Continue from the returned tool result.
-Never pretend a tool ran. If a tool fails, use the observation to correct your next decision."""
+For coding tasks, inspect the relevant existing files and establish a baseline before editing when practical.
+Use tool and command failures as evidence: diagnose them, make a focused repair, and run relevant verification after changes.
+Never pretend a tool or check ran, and never claim success that the observations do not support.
+In the final answer, honestly name changed files, verification commands and results, and any known limitations."""
 
 TerminationReason = Literal[
     "completed",
@@ -23,8 +30,6 @@ TerminationReason = Literal[
     "user_interrupt",
     "runtime_error",
 ]
-ToolEventHandler = Callable[[ToolCall, ToolResult], None]
-
 MODEL_REQUEST_ATTEMPTS = 3
 MODEL_RETRY_DELAYS = (0.5, 1.0)
 MAX_CONFIGURED_STEPS = 100
@@ -36,6 +41,17 @@ class AgentResult:
     answer: str | None
     steps: int
     message: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolEvent:
+    tool_call: ToolCall
+    result: ToolResult
+    dispatch_duration_ms: int
+    truncated: bool
+
+
+ToolEventHandler = Callable[[ToolEvent], None]
 
 
 class _FailureTracker:
@@ -93,6 +109,8 @@ class AgentRunner:
         *,
         tools: ToolRegistry,
         max_steps: int = 20,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
         on_tool_event: ToolEventHandler | None = None,
     ) -> None:
         if max_steps < 1 or max_steps > MAX_CONFIGURED_STEPS:
@@ -102,20 +120,24 @@ class AgentRunner:
         self._client = client
         self._tools = tools
         self._max_steps = max_steps
+        self._max_context_chars = max_context_chars
+        self._max_context_messages = max_context_messages
         self._on_tool_event = on_tool_event
 
     def run(self, task: str) -> AgentResult:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task},
-        ]
+        context = ConversationContext(
+            SYSTEM_PROMPT,
+            task,
+            max_chars=self._max_context_chars,
+            max_messages=self._max_context_messages,
+        )
         failures = _FailureTracker()
         current_step = 0
 
         try:
             for step in range(1, self._max_steps + 1):
                 current_step = step
-                response = self._request_model(messages)
+                response = self._request_model(context.messages_for_model())
 
                 if not response.tool_calls:
                     return AgentResult(
@@ -124,18 +146,22 @@ class AgentRunner:
                         steps=step,
                     )
 
-                messages.append(
-                    self._assistant_tool_call_message(
-                        response.text,
-                        response.tool_calls,
-                    )
+                assistant_message = self._assistant_tool_call_message(
+                    response.text,
+                    response.tool_calls,
                 )
+                tool_messages: list[dict[str, Any]] = []
                 for tool_call in response.tool_calls:
+                    dispatch_started = perf_counter()
                     result = self._tools.dispatch(
                         tool_call.name,
                         tool_call.arguments,
                     )
-                    messages.append(
+                    dispatch_duration_ms = max(
+                        0,
+                        round((perf_counter() - dispatch_started) * 1000),
+                    )
+                    tool_messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -144,7 +170,14 @@ class AgentRunner:
                         }
                     )
                     if self._on_tool_event is not None:
-                        self._on_tool_event(tool_call, result)
+                        self._on_tool_event(
+                            ToolEvent(
+                                tool_call=tool_call,
+                                result=result,
+                                dispatch_duration_ms=dispatch_duration_ms,
+                                truncated=_tool_result_is_truncated(result),
+                            )
+                        )
                     if failures.record(tool_call, result):
                         return AgentResult(
                             status="repeated_failure",
@@ -155,6 +188,7 @@ class AgentRunner:
                                 f"occurred for {tool_call.name}."
                             ),
                         )
+                context.add_tool_cycle(assistant_message, tool_messages)
 
             return AgentResult(
                 status="max_steps",
@@ -223,3 +257,13 @@ class AgentRunner:
                 for call in tool_calls
             ],
         }
+
+
+def _tool_result_is_truncated(result: ToolResult) -> bool:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    return any(
+        data.get(field) is True
+        for field in ("truncated", "stdout_truncated", "stderr_truncated")
+    )
