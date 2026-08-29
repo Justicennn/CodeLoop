@@ -415,7 +415,7 @@ def test_plan_guided_react_preserves_multi_action_cycles(
     ]
     assert schema_names[0] == UPDATE_PLAN_ACTION_NAME
     assert schema_names.count(UPDATE_PLAN_ACTION_NAME) == 1
-    assert len(schema_names) == 7
+    assert len(schema_names) == 8
 
 
 def test_plan_snapshot_and_schemas_are_stable_across_api_retry(

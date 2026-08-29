@@ -52,6 +52,7 @@ IGNORED_DIRECTORIES = {
 class ToolDefinition:
     schema: dict[str, Any]
     handler: ToolHandler
+    managed_workspace_mutation: bool = False
 
 
 class ToolInputError(Exception):
@@ -285,6 +286,22 @@ WRITE_FILE_SCHEMA: dict[str, Any] = {
     },
 }
 
+MAKE_DIRECTORY_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "make_directory",
+        "description": (
+            "Recursively create a directory inside the configured workspace root."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "minLength": 1}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 RUN_COMMAND_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -314,7 +331,7 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    """A direct registry of six workspace-bound coding tools."""
+    """A direct registry of seven workspace-bound coding tools."""
 
     def __init__(
         self,
@@ -334,8 +351,21 @@ class ToolRegistry:
             "list_files": ToolDefinition(LIST_FILES_SCHEMA, self._list_files),
             "read_file": ToolDefinition(READ_FILE_SCHEMA, self._read_file),
             "search_code": ToolDefinition(SEARCH_CODE_SCHEMA, self._search_code),
-            "edit_file": ToolDefinition(EDIT_FILE_SCHEMA, self._edit_file),
-            "write_file": ToolDefinition(WRITE_FILE_SCHEMA, self._write_file),
+            "edit_file": ToolDefinition(
+                EDIT_FILE_SCHEMA,
+                self._edit_file,
+                managed_workspace_mutation=True,
+            ),
+            "write_file": ToolDefinition(
+                WRITE_FILE_SCHEMA,
+                self._write_file,
+                managed_workspace_mutation=True,
+            ),
+            "make_directory": ToolDefinition(
+                MAKE_DIRECTORY_SCHEMA,
+                self._make_directory,
+                managed_workspace_mutation=True,
+            ),
             "run_command": ToolDefinition(RUN_COMMAND_SCHEMA, self._run_command),
         }
 
@@ -356,16 +386,54 @@ class ToolRegistry:
         try:
             arguments = json.loads(arguments_json)
         except (json.JSONDecodeError, TypeError):
-            return _error("invalid_arguments", "Tool arguments must be a JSON object")
-        if not isinstance(arguments, dict):
-            return _error("invalid_arguments", "Tool arguments must be a JSON object")
+            result = _error(
+                "invalid_arguments",
+                "Tool arguments must be a JSON object",
+            )
+        else:
+            if not isinstance(arguments, dict):
+                result = _error(
+                    "invalid_arguments",
+                    "Tool arguments must be a JSON object",
+                )
+            else:
+                try:
+                    result = definition.handler(arguments)
+                except (ToolInputError, WorkspaceError) as exc:
+                    result = _error(exc.error_code, exc.message, data=exc.data)
+                except OSError:
+                    result = _error(
+                        "tool_error",
+                        "The local tool operation failed.",
+                    )
+        return self._normalize_mutation_result(definition, result)
 
-        try:
-            return definition.handler(arguments)
-        except (ToolInputError, WorkspaceError) as exc:
-            return _error(exc.error_code, exc.message, data=exc.data)
-        except OSError:
-            return _error("tool_error", "The local tool operation failed.")
+    def confirmed_workspace_change(
+        self,
+        tool_name: str,
+        result: ToolResult,
+    ) -> bool:
+        """Trust effects only from registered managed-mutation tools."""
+        definition = self._tools.get(tool_name)
+        if definition is None or not definition.managed_workspace_mutation:
+            return False
+        data = result.get("data")
+        return isinstance(data, dict) and data.get("workspace_changed") is True
+
+    @staticmethod
+    def _normalize_mutation_result(
+        definition: ToolDefinition,
+        result: ToolResult,
+    ) -> ToolResult:
+        if not definition.managed_workspace_mutation:
+            return result
+        normalized = dict(result)
+        original_data = result.get("data")
+        data = dict(original_data) if isinstance(original_data, dict) else {}
+        if not isinstance(data.get("workspace_changed"), bool):
+            data["workspace_changed"] = False
+        normalized["data"] = data
+        return normalized
 
     def _list_files(self, arguments: dict[str, Any]) -> ToolResult:
         _validate_fields(arguments, allowed={"path", "max_depth"})
@@ -680,6 +748,16 @@ class ToolRegistry:
             1,
         )
         updated = logical_updated.replace("\n", newline_style)
+        if updated == content:
+            return _success(
+                {
+                    "path": self._workspace.relative_path(path),
+                    "replacements": 1,
+                    "before_chars": len(content),
+                    "after_chars": len(updated),
+                    "workspace_changed": False,
+                }
+            )
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -711,6 +789,7 @@ class ToolRegistry:
                 "replacements": 1,
                 "before_chars": len(content),
                 "after_chars": len(updated),
+                "workspace_changed": True,
             }
         )
 
@@ -723,16 +802,132 @@ class ToolRegistry:
         path_value = _string_argument(arguments, "path")
         content = _string_argument(arguments, "content")
         path = self._workspace.resolve_new_file(path_value)
+        created = False
         try:
-            with path.open("xb") as output:
+            output = path.open("xb")
+            created = True
+            with output:
                 output.write(content.encode("utf-8"))
         except FileExistsError:
             return _error("file_exists", f"File already exists: {path_value}")
+        except OSError:
+            return _error(
+                "tool_error",
+                "The local file operation failed.",
+                data={
+                    "path": path_value,
+                    "workspace_changed": created and path.exists(),
+                },
+            )
         return _success(
             {
                 "path": self._workspace.relative_path(path),
                 "characters": len(content),
+                "workspace_changed": True,
             }
+        )
+
+    def _make_directory(self, arguments: dict[str, Any]) -> ToolResult:
+        _validate_fields(arguments, allowed={"path"}, required={"path"})
+        path_value = _string_argument(arguments, "path", allow_empty=False)
+        target = self._workspace.resolve_directory_target(path_value)
+        target_relative = self._workspace.relative_path(target)
+
+        if target.exists():
+            if not target.is_dir():
+                return _error(
+                    "path_conflict",
+                    f"Directory target conflicts with a file: {path_value}",
+                )
+            return _success(
+                {
+                    "path": target_relative,
+                    "created_directories": [],
+                    "created_count": 0,
+                    "workspace_changed": False,
+                }
+            )
+
+        missing: list[Path] = []
+        current = target
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+
+        if not current.is_dir():
+            return _error(
+                "path_conflict",
+                f"A parent path is not a directory: {path_value}",
+            )
+
+        created_directories: list[str] = []
+        for directory in reversed(missing):
+            relative = self._workspace.relative_path(directory)
+            try:
+                parent_relative = self._workspace.relative_path(directory.parent)
+                self._workspace.resolve(parent_relative, expected="directory")
+                directory.mkdir()
+                created_directories.append(relative)
+                self._workspace.resolve(relative, expected="directory")
+            except FileExistsError:
+                if directory.is_dir():
+                    continue
+                return self._directory_failure(
+                    "path_conflict",
+                    f"Directory target conflicts with a file: {path_value}",
+                    path=target_relative,
+                    created_directories=created_directories,
+                )
+            except WorkspaceError as exc:
+                return self._directory_failure(
+                    exc.error_code,
+                    exc.message,
+                    path=target_relative,
+                    created_directories=created_directories,
+                )
+            except OSError:
+                return self._directory_failure(
+                    "tool_error",
+                    "The local directory operation failed.",
+                    path=target_relative,
+                    created_directories=created_directories,
+                )
+
+        try:
+            resolved = self._workspace.resolve(path_value, expected="directory")
+        except WorkspaceError as exc:
+            return self._directory_failure(
+                exc.error_code,
+                exc.message,
+                path=target_relative,
+                created_directories=created_directories,
+            )
+        return _success(
+            {
+                "path": self._workspace.relative_path(resolved),
+                "created_directories": created_directories,
+                "created_count": len(created_directories),
+                "workspace_changed": bool(created_directories),
+            }
+        )
+
+    @staticmethod
+    def _directory_failure(
+        error_code: str,
+        message: str,
+        *,
+        path: str,
+        created_directories: list[str],
+    ) -> ToolResult:
+        return _error(
+            error_code,
+            message,
+            data={
+                "path": path,
+                "created_directories": list(created_directories),
+                "created_count": len(created_directories),
+                "workspace_changed": bool(created_directories),
+            },
         )
 
     def _run_command(self, arguments: dict[str, Any]) -> ToolResult:

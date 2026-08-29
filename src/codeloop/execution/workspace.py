@@ -82,9 +82,55 @@ class Workspace:
             )
         return candidate
 
+    def resolve_directory_target(self, value: str) -> Path:
+        """Resolve an existing or new directory target inside the fixed root.
+
+        Existing path components are resolved strictly so symlinks cannot move
+        the target outside the workspace.  Missing components are returned as a
+        canonical tail below the nearest existing workspace directory; this
+        method never creates the workspace root or any child directory.
+        """
+        relative = self._validate_relative(value)
+        current = self._root
+        parts = relative.parts
+
+        for index, part in enumerate(parts):
+            candidate = current / part
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError:
+                try:
+                    target = current.joinpath(*parts[index:]).resolve(strict=False)
+                except (OSError, RuntimeError) as exc:
+                    raise WorkspaceError(
+                        "invalid_path",
+                        f"Path cannot be resolved: {value}",
+                    ) from exc
+                self._ensure_contained(target, value)
+                return target
+            except (OSError, RuntimeError) as exc:
+                raise WorkspaceError(
+                    "invalid_path",
+                    f"Path cannot be resolved: {value}",
+                ) from exc
+
+            self._ensure_contained(resolved, value)
+            if not resolved.is_dir():
+                raise WorkspaceError(
+                    "path_conflict",
+                    f"A path component is not a directory: {value}",
+                )
+            current = resolved
+
+        return current
+
     def relative_path(self, path: Path) -> str:
         relative = path.relative_to(self._root)
         return relative.as_posix() if relative.parts else "."
+
+    def _ensure_contained(self, path: Path, value: str) -> None:
+        if path != self._root and self._root not in path.parents:
+            raise WorkspaceError("invalid_path", f"Path escapes workspace: {value}")
 
     @staticmethod
     def _validate_relative(value: str) -> Path:

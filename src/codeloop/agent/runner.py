@@ -177,6 +177,11 @@ class AgentRunner:
                             tool_call.name,
                             tool_call.arguments,
                         )
+                        if self._tools.confirmed_workspace_change(
+                            tool_call.name,
+                            result,
+                        ):
+                            task_state.record_workspace_change()
                     dispatch_duration_ms = max(
                         0,
                         round((perf_counter() - dispatch_started) * 1000),
