@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
+
+from .conversation import PublicConversationTurn
 
 Message = dict[str, Any]
 
@@ -27,6 +30,7 @@ class ConversationContext:
         system_prompt: str,
         task: str,
         *,
+        previous_turns: Sequence[PublicConversationTurn] = (),
         max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
     ) -> None:
@@ -47,12 +51,21 @@ class ConversationContext:
             "content": system_prompt,
         }
         self._runtime_state_json: str | None = None
+        self._previous_pairs: list[list[Message]] = [
+            [
+                {"role": "user", "content": turn.user},
+                {"role": "assistant", "content": turn.assistant},
+            ]
+            for turn in tuple(previous_turns)
+        ]
         self._task_message: Message = {"role": "user", "content": task}
         self._max_chars = max_chars
         self._max_messages = max_messages
         self._cycles: list[list[Message]] = []
         self._removed_cycles = 0
         self._removed_messages = 0
+        self._removed_previous_pairs = 0
+        self._removed_previous_messages = 0
         self._overflow = False
         self._rebalance()
 
@@ -95,6 +108,11 @@ class ConversationContext:
     def _rebalance(self) -> None:
         self._overflow = False
         while not self._within_budget(self._compose_messages()):
+            if self._previous_pairs:
+                removed_pair = self._previous_pairs.pop(0)
+                self._removed_previous_pairs += 1
+                self._removed_previous_messages += len(removed_pair)
+                continue
             if len(self._cycles) <= 1:
                 self._overflow = True
                 return
@@ -104,8 +122,10 @@ class ConversationContext:
 
     def _compose_messages(self) -> list[Message]:
         messages = [self._composed_system_message()]
-        if self._removed_cycles or self._overflow:
+        if self._removed_previous_pairs or self._removed_cycles or self._overflow:
             messages.append(self._notice_message())
+        for pair in self._previous_pairs:
+            messages.extend(pair)
         messages.append(self._task_message)
         for cycle in self._cycles:
             messages.extend(cycle)
@@ -125,9 +145,18 @@ class ConversationContext:
 
     def _notice_message(self) -> Message:
         metadata = {
-            "conversation_history_trimmed": self._removed_cycles > 0,
-            "guidance": "Older tool evidence is unavailable; re-read files if needed.",
+            "conversation_history_trimmed": (
+                self._removed_previous_pairs > 0 or self._removed_cycles > 0
+            ),
+            "guidance": (
+                "Older public conversation or tool evidence is unavailable; "
+                "re-read files if needed."
+                if self._removed_previous_pairs
+                else "Older tool evidence is unavailable; re-read files if needed."
+            ),
             "overflow": self._overflow,
+            "removed_previous_pairs": self._removed_previous_pairs,
+            "removed_previous_messages": self._removed_previous_messages,
             "removed_cycles": self._removed_cycles,
             "removed_messages": self._removed_messages,
         }

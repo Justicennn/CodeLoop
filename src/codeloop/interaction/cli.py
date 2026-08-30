@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ..agent.runner import (
@@ -26,6 +26,8 @@ from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import OpenAICompatibleClient
 from .console import ConsoleRenderer
+from .narration import _NarratingModelClient
+from .session import InteractiveSession
 
 EXIT_CODES: dict[TerminationReason, int] = {
     "completed": 0,
@@ -40,12 +42,25 @@ EXIT_CODES: dict[TerminationReason, int] = {
 
 def _show_fallback_result(result: AgentResult) -> None:
     if result.status == "completed":
-        print(f"[final] {result.answer}")
-    fields = [f"status={result.status}", f"steps={result.steps}"]
+        print(f"✓ Done · {result.steps} steps")
+        if result.verification_status == "verified":
+            print("✓ Verified")
+        elif result.verification_status == "unverified":
+            print("⚠ Unverified")
+        if result.answer:
+            print()
+            print(result.answer)
+        return
+    print(f"✗ Stopped · {result.status}", file=sys.stderr)
     if result.message:
-        fields.append(f"message={result.message}")
-    output = f"[termination] {' '.join(fields)}"
-    print(output, file=sys.stdout if result.status == "completed" else sys.stderr)
+        print(result.message, file=sys.stderr)
+
+
+def _show_plain_narration(text: str) -> None:
+    narration = text.strip()
+    if narration:
+        print(narration)
+        print()
 
 
 def _render_best_effort(
@@ -106,7 +121,11 @@ def _bounded_integer(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CodeLoop agent.")
-    parser.add_argument("task", help="Task for the model to complete")
+    parser.add_argument(
+        "task",
+        nargs="?",
+        help="Task for one-shot mode; omit to start an interactive session",
+    )
     parser.add_argument(
         "--workspace",
         default=".",
@@ -134,8 +153,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = _parser().parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     api_key = os.environ.get("MODEL_API_KEY", "")
     base_url = os.environ.get("MODEL_BASE_URL", "")
     model = os.environ.get("MODEL_NAME", "")
@@ -149,20 +168,42 @@ def main() -> int:
 
     try:
         workspace = Workspace(Path(args.workspace))
-        registry = ToolRegistry(workspace, sensitive_values=(api_key,))
         client = OpenAICompatibleClient(
             api_key=api_key,
             base_url=base_url,
             model=model,
         )
+        if args.task is None:
+            return InteractiveSession(
+                client,
+                model_name=model,
+                workspace=workspace,
+                sensitive_values=(api_key,),
+                max_steps=args.max_steps,
+                max_context_chars=args.max_context_chars,
+                max_context_messages=args.max_context_messages,
+            ).run()
+
+        registry = ToolRegistry(workspace, sensitive_values=(api_key,))
         try:
             renderer: ConsoleRenderer | None = ConsoleRenderer()
         except Exception:
             renderer = None
         if renderer is not None:
-            _render_best_effort(renderer.show_header, model, workspace.root, args.task)
-        result = AgentRunner(
+            _render_best_effort(
+                renderer.show_header,
+                model,
+                workspace.root,
+                args.task,
+            )
+        presented_client = _NarratingModelClient(
             client,
+            getattr(renderer, "show_narration", None)
+            if renderer is not None
+            else _show_plain_narration,
+        )
+        result = AgentRunner(
+            presented_client,
             tools=registry,
             max_steps=args.max_steps,
             max_context_chars=args.max_context_chars,
