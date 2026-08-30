@@ -31,6 +31,7 @@ EXIT_CODES: dict[TerminationReason, int] = {
     "completed": 0,
     "max_steps": 1,
     "repeated_failure": 1,
+    "no_progress": 1,
     "runtime_error": 1,
     "fatal_api_error": 2,
     "user_interrupt": 130,

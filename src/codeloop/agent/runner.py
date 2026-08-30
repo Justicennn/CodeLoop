@@ -24,6 +24,7 @@ from .plan import (
     apply_plan_action,
 )
 from .prompt import SYSTEM_PROMPT
+from .progress import ProgressAction, ProgressFacts, ProgressTracker
 from .task_state import PlanOutcome, TaskState
 from .verification import VerificationAttempt, VerificationStatus
 
@@ -31,6 +32,7 @@ TerminationReason = Literal[
     "completed",
     "max_steps",
     "repeated_failure",
+    "no_progress",
     "fatal_api_error",
     "user_interrupt",
     "runtime_error",
@@ -155,6 +157,7 @@ class AgentRunner:
             max_messages=self._max_context_messages,
         )
         task_state = TaskState()
+        progress_tracker = ProgressTracker()
         failures = _FailureTracker()
         current_step = 0
 
@@ -191,9 +194,12 @@ class AgentRunner:
                     response.text,
                     response.tool_calls,
                 )
+                progress_before = _progress_facts(task_state)
+                progress_actions: list[ProgressAction] = []
                 tool_messages: list[dict[str, Any]] = []
                 for tool_call in response.tool_calls:
                     dispatch_started = perf_counter()
+                    plan_before = task_state.plan
                     if tool_call.name == UPDATE_PLAN_ACTION_NAME:
                         result = apply_plan_action(task_state, tool_call.arguments)
                     else:
@@ -211,6 +217,16 @@ class AgentRunner:
                                 model_step=step,
                                 result=result,
                             )
+                    progress_actions.append(
+                        ProgressAction(
+                            name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            result=result,
+                            workspace_revision=task_state.workspace_revision,
+                            plan_before=plan_before,
+                            plan_after=task_state.plan,
+                        )
+                    )
                     dispatch_duration_ms = max(
                         0,
                         round((perf_counter() - dispatch_started) * 1000),
@@ -248,6 +264,36 @@ class AgentRunner:
                             ),
                         )
                 context.add_tool_cycle(assistant_message, tool_messages)
+                progress_decision = progress_tracker.evaluate_turn(
+                    task_state.progress,
+                    before=progress_before,
+                    after=_progress_facts(task_state),
+                    actions=tuple(progress_actions),
+                )
+                if progress_decision == "terminate_no_progress":
+                    return self._result(
+                        task_state,
+                        status="no_progress",
+                        answer=None,
+                        steps=step,
+                        message=(
+                            "No material progress was detected after one bounded "
+                            "recovery attempt."
+                        ),
+                    )
+                if (
+                    progress_decision == "request_recovery"
+                    and step >= self._max_steps
+                ):
+                    return self._result(
+                        task_state,
+                        status="max_steps",
+                        answer=None,
+                        steps=self._max_steps,
+                        message=(
+                            f"Maximum model decisions reached: {self._max_steps}."
+                        ),
+                    )
 
             return self._result(
                 task_state,
@@ -356,6 +402,13 @@ def _tool_result_is_truncated(result: ToolResult) -> bool:
     return any(
         data.get(field) is True
         for field in ("truncated", "stdout_truncated", "stderr_truncated")
+    )
+
+
+def _progress_facts(task_state: TaskState) -> ProgressFacts:
+    return ProgressFacts(
+        workspace_revision=task_state.workspace_revision,
+        verification_status=task_state.verification_status,
     )
 
 

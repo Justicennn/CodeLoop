@@ -13,6 +13,7 @@ import pytest
 from rich.console import Console
 
 import codeloop.agent.runner as agent_module
+import codeloop.execution.tools as tools_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.events import ToolEvent
 from codeloop.agent.runner import AgentRunner, _FailureTracker
@@ -475,6 +476,57 @@ def test_command_timeout_terminates_and_reaps_direct_child(
     assert result["data"]["direct_child_reaped"] is True
     assert "started" in result["data"]["stdout"]
     assert not (tmp_path / "survived.txt").exists()
+
+
+def test_run_command_decodes_utf8_chinese_stdout_and_stderr(
+    tmp_path: Path,
+) -> None:
+    stdout_text = "中文标准输出"
+    stderr_text = "中文错误输出"
+    code = (
+        "import sys; "
+        f"sys.stdout.buffer.write({stdout_text.encode('utf-8')!r}); "
+        f"sys.stderr.buffer.write({stderr_text.encode('utf-8')!r})"
+    )
+
+    result = ToolRegistry(Workspace(tmp_path)).dispatch(
+        "run_command",
+        json.dumps({"command": [sys.executable, "-c", code]}),
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["stdout"] == stdout_text
+    assert result["data"]["stderr"] == stderr_text
+
+
+def test_command_output_decode_falls_back_to_local_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools_module,
+        "_local_command_output_encodings",
+        lambda: ("gbk",),
+    )
+    expected = "本地编码输出"
+
+    assert tools_module._decode_command_output(expected.encode("gbk")) == expected
+
+
+def test_run_command_preserves_ascii_output(tmp_path: Path) -> None:
+    code = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'ascii stdout'); "
+        "sys.stderr.buffer.write(b'ascii stderr')"
+    )
+
+    result = ToolRegistry(Workspace(tmp_path)).dispatch(
+        "run_command",
+        json.dumps({"command": [sys.executable, "-c", code]}),
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["stdout"] == "ascii stdout"
+    assert result["data"]["stderr"] == "ascii stderr"
 
 
 def test_repeated_failure_stops_before_remaining_tool_calls(

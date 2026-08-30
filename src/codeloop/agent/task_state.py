@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .plan import PlanStep, TaskPlan
+from .progress import ProgressState
 from .verification import VerificationState, VerificationStatus
 
 PlanOutcome = Literal[
@@ -28,6 +29,7 @@ class TaskState:
     plan: TaskPlan | None = None
     workspace_revision: int = 0
     verification: VerificationState = field(default_factory=VerificationState)
+    progress: ProgressState = field(default_factory=ProgressState)
     last_completion_review_fingerprint: CompletionReviewFingerprint | None = None
     pending_completion_review: dict[str, Any] | None = None
 
@@ -108,6 +110,9 @@ class TaskState:
             )
         if self.pending_completion_review is not None:
             snapshot["completion_review"] = dict(self.pending_completion_review)
+        progress_snapshot = self.progress.snapshot_for_model()
+        if progress_snapshot is not None:
+            snapshot["progress"] = progress_snapshot
         return snapshot or None
 
     def _completion_review_reasons(self) -> tuple[str, ...]:

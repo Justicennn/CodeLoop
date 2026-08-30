@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 import json
+import locale
 import os
 import re
 import shutil
@@ -162,6 +164,58 @@ def _decode_utf8(path: Path) -> str:
             "unsupported_encoding",
             f"File is not valid UTF-8: {path.name}",
         ) from exc
+
+
+def _local_command_output_encodings() -> tuple[str, ...]:
+    """Return deterministic local-code-page fallbacks after UTF-8."""
+    candidates = [
+        *(("mbcs",) if os.name == "nt" else ()),
+        locale.getencoding(),
+        locale.getpreferredencoding(False),
+    ]
+    encodings: list[str] = []
+    canonical_names: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            canonical = codecs.lookup(candidate).name
+        except LookupError:
+            continue
+        if canonical == "utf-8" or canonical in canonical_names:
+            continue
+        canonical_names.add(canonical)
+        encodings.append(candidate)
+    return tuple(encodings)
+
+
+def _decode_command_output(value: bytes) -> str:
+    """Decode captured output as UTF-8 first, then the local code page.
+
+    UTF-8-first avoids Windows locale decoding valid UTF-8 bytes into mojibake.
+    The strict local attempts preserve output from legacy native programs, while
+    the final replacement pass guarantees a string for malformed byte streams.
+    """
+    if not value:
+        return ""
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    local_encodings = _local_command_output_encodings()
+    for encoding in local_encodings:
+        try:
+            return value.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    if local_encodings:
+        try:
+            return value.decode(local_encodings[0], errors="replace")
+        except LookupError:
+            pass
+    return value.decode("utf-8", errors="replace")
 
 
 def _normalize_newlines(text: str) -> str:
@@ -966,8 +1020,6 @@ class ToolRegistry:
                 shell=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
             )
         except FileNotFoundError:
             return _error(
@@ -978,14 +1030,14 @@ class ToolRegistry:
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            stdout, stderr = self._terminate_and_collect(process)
+            stdout_bytes, stderr_bytes = self._terminate_and_collect(process)
             duration_ms = round((time.perf_counter() - started) * 1000, 3)
             data = self._command_result_data(
                 command=command,
                 cwd=cwd,
                 exit_code=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=_decode_command_output(stdout_bytes),
+                stderr=_decode_command_output(stderr_bytes),
                 duration_ms=duration_ms,
                 timeout_seconds=timeout_seconds,
                 timed_out=True,
@@ -1005,8 +1057,8 @@ class ToolRegistry:
             command=command,
             cwd=cwd,
             exit_code=process.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=_decode_command_output(stdout),
+            stderr=_decode_command_output(stderr),
             duration_ms=duration_ms,
             timeout_seconds=timeout_seconds,
             timed_out=False,
@@ -1022,8 +1074,8 @@ class ToolRegistry:
 
     def _terminate_and_collect(
         self,
-        process: subprocess.Popen[str],
-    ) -> tuple[str, str]:
+        process: subprocess.Popen[bytes],
+    ) -> tuple[bytes, bytes]:
         if process.poll() is None:
             try:
                 process.terminate()
@@ -1040,7 +1092,7 @@ class ToolRegistry:
                 except OSError:
                     pass
             stdout, stderr = process.communicate()
-        return stdout or "", stderr or ""
+        return stdout or b"", stderr or b""
 
     def _command_result_data(
         self,
