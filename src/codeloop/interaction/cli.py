@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ..agent.runner import (
@@ -26,6 +26,7 @@ from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import OpenAICompatibleClient
 from .console import ConsoleRenderer
+from .session import InteractiveSession
 
 EXIT_CODES: dict[TerminationReason, int] = {
     "completed": 0,
@@ -106,7 +107,11 @@ def _bounded_integer(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CodeLoop agent.")
-    parser.add_argument("task", help="Task for the model to complete")
+    parser.add_argument(
+        "task",
+        nargs="?",
+        help="Task for one-shot mode; omit to start an interactive session",
+    )
     parser.add_argument(
         "--workspace",
         default=".",
@@ -134,8 +139,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = _parser().parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     api_key = os.environ.get("MODEL_API_KEY", "")
     base_url = os.environ.get("MODEL_BASE_URL", "")
     model = os.environ.get("MODEL_NAME", "")
@@ -149,12 +154,23 @@ def main() -> int:
 
     try:
         workspace = Workspace(Path(args.workspace))
-        registry = ToolRegistry(workspace, sensitive_values=(api_key,))
         client = OpenAICompatibleClient(
             api_key=api_key,
             base_url=base_url,
             model=model,
         )
+        if args.task is None:
+            return InteractiveSession(
+                client,
+                model_name=model,
+                workspace=workspace,
+                sensitive_values=(api_key,),
+                max_steps=args.max_steps,
+                max_context_chars=args.max_context_chars,
+                max_context_messages=args.max_context_messages,
+            ).run()
+
+        registry = ToolRegistry(workspace, sensitive_values=(api_key,))
         try:
             renderer: ConsoleRenderer | None = ConsoleRenderer()
         except Exception:

@@ -325,6 +325,8 @@ def test_context_trims_complete_cycles_and_counts_notice_in_budgets() -> None:
         "overflow": False,
         "removed_cycles": 3,
         "removed_messages": 6,
+        "removed_previous_messages": 0,
+        "removed_previous_pairs": 0,
     }
     declared_ids = [
         call["id"]
@@ -510,6 +512,20 @@ def test_command_output_decode_falls_back_to_local_encoding(
     expected = "本地编码输出"
 
     assert tools_module._decode_command_output(expected.encode("gbk")) == expected
+
+
+def test_command_output_decode_replaces_unknown_bytes_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools_module,
+        "_local_command_output_encodings",
+        lambda: (),
+    )
+
+    assert tools_module._decode_command_output(b"ascii-then-\xff") == (
+        "ascii-then-\ufffd"
+    )
 
 
 def test_run_command_preserves_ascii_output(tmp_path: Path) -> None:

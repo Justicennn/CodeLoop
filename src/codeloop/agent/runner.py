@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from time import perf_counter, sleep
@@ -16,6 +16,7 @@ from .context import (
     DEFAULT_MAX_CONTEXT_MESSAGES,
     ConversationContext,
 )
+from .conversation import PublicConversationTurn
 from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
 from .plan import (
     PlanStep,
@@ -149,10 +150,16 @@ class AgentRunner:
             )
         self._action_schemas = [UPDATE_PLAN_SCHEMA, *execution_schemas]
 
-    def run(self, task: str) -> AgentResult:
+    def run(
+        self,
+        task: str,
+        *,
+        previous_turns: Sequence[PublicConversationTurn] = (),
+    ) -> AgentResult:
         context = ConversationContext(
             SYSTEM_PROMPT,
             task,
+            previous_turns=previous_turns,
             max_chars=self._max_context_chars,
             max_messages=self._max_context_messages,
         )

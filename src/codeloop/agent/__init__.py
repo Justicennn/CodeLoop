@@ -1,5 +1,6 @@
 """Agent Core public surface."""
 
+from .conversation import PublicConversationTurn
 from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
 from .plan import PlanStatus, PlanStep, TaskPlan
 from .progress import ProgressState, ProgressStatus, ProgressTracker
@@ -17,6 +18,7 @@ __all__ = [
     "ProgressState",
     "ProgressStatus",
     "ProgressTracker",
+    "PublicConversationTurn",
     "TaskPlan",
     "TaskState",
     "TerminationReason",
