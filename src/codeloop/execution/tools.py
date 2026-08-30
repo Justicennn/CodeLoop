@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .command_policy import CommandApprovalRequest, dependency_mutation_request
 from .workspace import Workspace, WorkspaceError
 
 ToolResult = dict[str, Any]
@@ -27,6 +28,14 @@ MAX_READ_LINES = 200
 MAX_TEXT_CHARS = 20_000
 MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 50
+MAX_OVERVIEW_PATH_CHARS = 1_000
+MAX_OVERVIEW_DEPTH = 5
+MAX_OVERVIEW_SCAN_ENTRIES = 5_000
+MAX_OVERVIEW_TREE_ENTRIES = 250
+MAX_OVERVIEW_ANCHORS = 40
+MAX_OVERVIEW_DIRECTORY_CANDIDATES = 24
+MAX_OVERVIEW_EXTENSION_STATS = 20
+MAX_OVERVIEW_DATA_CHARS = 20_000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 60
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 TERMINATION_GRACE_SECONDS = 2
@@ -47,6 +56,17 @@ IGNORED_DIRECTORIES = {
     "node_modules",
     "dist",
     "build",
+}
+
+_OVERVIEW_IGNORED_DIRECTORIES = IGNORED_DIRECTORIES | {"coverage", "target"}
+_OVERVIEW_DIRECTORY_NAMES = {
+    "src",
+    "lib",
+    "app",
+    "tests",
+    "test",
+    "docs",
+    "config",
 }
 
 
@@ -248,6 +268,38 @@ def _truncate(text: str, limit: int = MAX_TEXT_CHARS) -> tuple[str, bool]:
     return text[:limit], True
 
 
+def _anchor_priority(filename: str) -> int | None:
+    """Return the fixed overview retention tier for one file basename."""
+    folded = filename.casefold()
+    if folded == "agents.md":
+        return 1
+    if folded.startswith("readme"):
+        return 2
+    if (
+        folded
+        in {
+            "pyproject.toml",
+            "package.json",
+            "cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "cmakelists.txt",
+            "makefile",
+        }
+        or folded.startswith("build.gradle")
+        or folded.startswith("settings.gradle")
+        or (folded.startswith("requirements") and folded.endswith(".txt"))
+    ):
+        return 3
+    if folded in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}:
+        return 4
+    if folded.startswith("dockerfile") or folded.startswith("docker-compose"):
+        return 5
+    if folded == ".gitignore":
+        return 6
+    return None
+
+
 LIST_FILES_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -262,6 +314,34 @@ LIST_FILES_SCHEMA: dict[str, Any] = {
                     "minimum": 1,
                     "maximum": MAX_LIST_DEPTH,
                     "default": 4,
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+REPOSITORY_OVERVIEW_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "repository_overview",
+        "description": (
+            "Return a deterministic, strictly bounded structural overview of a "
+            "workspace directory. It does not read file contents or infer behavior."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "maxLength": MAX_OVERVIEW_PATH_CHARS,
+                    "default": ".",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_OVERVIEW_DEPTH,
+                    "default": 3,
                 },
             },
             "additionalProperties": False,
@@ -385,7 +465,7 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    """A direct registry of seven workspace-bound coding tools."""
+    """A direct registry of eight workspace-bound coding tools."""
 
     def __init__(
         self,
@@ -402,6 +482,10 @@ class ToolRegistry:
             )
         )
         self._tools = {
+            "repository_overview": ToolDefinition(
+                REPOSITORY_OVERVIEW_SCHEMA,
+                self._repository_overview,
+            ),
             "list_files": ToolDefinition(LIST_FILES_SCHEMA, self._list_files),
             "read_file": ToolDefinition(READ_FILE_SCHEMA, self._read_file),
             "search_code": ToolDefinition(SEARCH_CODE_SCHEMA, self._search_code),
@@ -461,6 +545,30 @@ class ToolRegistry:
                         "The local tool operation failed.",
                     )
         return self._normalize_mutation_result(definition, result)
+
+    def command_approval_request(
+        self,
+        tool_name: str,
+        arguments_json: str,
+    ) -> CommandApprovalRequest | None:
+        """Preflight one valid run_command without starting a subprocess."""
+        if tool_name != "run_command":
+            return None
+        try:
+            arguments = json.loads(arguments_json)
+            if not isinstance(arguments, dict):
+                return None
+            command, _cwd, _timeout = self._validated_run_command_arguments(
+                arguments
+            )
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ToolInputError,
+            WorkspaceError,
+        ):
+            return None
+        return dependency_mutation_request(command)
 
     def confirmed_workspace_change(
         self,
@@ -548,6 +656,270 @@ class ToolRegistry:
                 "truncated": truncated,
             }
         )
+
+    def _repository_overview(self, arguments: dict[str, Any]) -> ToolResult:
+        _validate_fields(arguments, allowed={"path", "max_depth"})
+        path_value = _string_argument(arguments, "path", default=".")
+        if len(path_value) > MAX_OVERVIEW_PATH_CHARS:
+            raise ToolInputError(
+                "invalid_arguments",
+                f"path must not exceed {MAX_OVERVIEW_PATH_CHARS} characters",
+            )
+        max_depth = _integer_argument(
+            arguments,
+            "max_depth",
+            default=3,
+            minimum=1,
+            maximum=MAX_OVERVIEW_DEPTH,
+        )
+        start = self._workspace.resolve(path_value, expected="directory")
+        start_relative = start.relative_to(self._workspace.root)
+        if any(
+            part in _OVERVIEW_IGNORED_DIRECTORIES
+            for part in start_relative.parts
+        ):
+            raise ToolInputError(
+                "invalid_path",
+                "Repository overview cannot inspect ignored directories",
+            )
+
+        tree_entries: list[dict[str, Any]] = []
+        anchor_candidates: list[tuple[int, str]] = []
+        directory_candidates: list[str] = []
+        extension_counts: dict[str, int] = {}
+        scanned_entries = 0
+        scanned_files = 0
+        scanned_directories = 0
+        scanned_symlinks = 0
+        scan_truncated = False
+        tree_depth_truncated = False
+        tree_entry_truncated = False
+
+        def visit(directory: Path, depth: int) -> bool:
+            nonlocal scanned_entries
+            nonlocal scanned_files
+            nonlocal scanned_directories
+            nonlocal scanned_symlinks
+            nonlocal scan_truncated
+            nonlocal tree_depth_truncated
+            nonlocal tree_entry_truncated
+
+            try:
+                children = sorted(
+                    directory.iterdir(),
+                    key=lambda item: (item.name.casefold(), item.name),
+                )
+            except OSError as exc:
+                raise ToolInputError(
+                    "file_access_error",
+                    "Cannot inspect directory: "
+                    f"{self._workspace.relative_path(directory)}",
+                ) from exc
+
+            for child in children:
+                if child.name in _OVERVIEW_IGNORED_DIRECTORIES:
+                    continue
+                if scanned_entries >= MAX_OVERVIEW_SCAN_ENTRIES:
+                    scan_truncated = True
+                    return False
+
+                relative = self._workspace.relative_path(child)
+                scanned_entries += 1
+                if child.is_symlink():
+                    entry_type = "symlink"
+                    scanned_symlinks += 1
+                elif child.is_dir():
+                    entry_type = "directory"
+                    scanned_directories += 1
+                else:
+                    entry_type = "file"
+                    scanned_files += 1
+
+                if depth <= max_depth:
+                    if len(tree_entries) < MAX_OVERVIEW_TREE_ENTRIES:
+                        tree_entries.append(
+                            {"path": relative, "type": entry_type, "depth": depth}
+                        )
+                    else:
+                        tree_entry_truncated = True
+                else:
+                    tree_depth_truncated = True
+
+                if entry_type == "file":
+                    priority = _anchor_priority(child.name)
+                    if priority is not None:
+                        anchor_candidates.append((priority, relative))
+                    extension = child.suffix.casefold()
+                    if extension:
+                        extension_counts[extension] = (
+                            extension_counts.get(extension, 0) + 1
+                        )
+                elif entry_type == "directory":
+                    if child.name.casefold() in _OVERVIEW_DIRECTORY_NAMES:
+                        directory_candidates.append(relative)
+                    if not visit(child, depth + 1):
+                        return False
+            return True
+
+        visit(start, 1)
+
+        anchor_candidates.sort(
+            key=lambda item: (item[0], item[1].casefold(), item[1])
+        )
+        all_anchors = [path for _, path in anchor_candidates]
+        directory_candidates.sort(key=lambda path: (path.casefold(), path))
+        extension_stats = [
+            {"extension": extension, "count": count}
+            for extension, count in sorted(
+                extension_counts.items(),
+                key=lambda item: (-item[1], item[0].casefold(), item[0]),
+            )
+        ]
+
+        anchors_limited = len(all_anchors) > MAX_OVERVIEW_ANCHORS
+        directories_limited = (
+            len(directory_candidates) > MAX_OVERVIEW_DIRECTORY_CANDIDATES
+        )
+        extensions_limited = len(extension_stats) > MAX_OVERVIEW_EXTENSION_STATS
+        anchors = all_anchors[:MAX_OVERVIEW_ANCHORS]
+        directories = directory_candidates[:MAX_OVERVIEW_DIRECTORY_CANDIDATES]
+        extensions = extension_stats[:MAX_OVERVIEW_EXTENSION_STATS]
+        output_truncated = {
+            "tree": False,
+            "anchors": False,
+            "directory_candidates": False,
+            "extension_stats": False,
+        }
+        reasons: set[str] = set()
+        if scan_truncated:
+            reasons.add("scan_entry_limit")
+        if tree_depth_truncated:
+            reasons.add("tree_depth_limit")
+        if tree_entry_truncated:
+            reasons.add("tree_entry_limit")
+        if anchors_limited:
+            reasons.add("anchor_limit")
+        if directories_limited:
+            reasons.add("directory_candidate_limit")
+        if extensions_limited:
+            reasons.add("extension_stats_limit")
+
+        def build_data() -> dict[str, Any]:
+            scan_reasons = ["scan_entry_limit"] if scan_truncated else []
+            tree_reasons = []
+            if tree_depth_truncated:
+                tree_reasons.append("tree_depth_limit")
+            if tree_entry_truncated:
+                tree_reasons.append("tree_entry_limit")
+            if output_truncated["tree"]:
+                tree_reasons.append("output_chars")
+            anchor_reasons = []
+            if anchors_limited:
+                anchor_reasons.append("anchor_limit")
+            if output_truncated["anchors"]:
+                anchor_reasons.append("output_chars")
+            directory_reasons = []
+            if directories_limited:
+                directory_reasons.append("directory_candidate_limit")
+            if output_truncated["directory_candidates"]:
+                directory_reasons.append("output_chars")
+            extension_reasons = []
+            if extensions_limited:
+                extension_reasons.append("extension_stats_limit")
+            if output_truncated["extension_stats"]:
+                extension_reasons.append("output_chars")
+            data: dict[str, Any] = {
+                "path": self._workspace.relative_path(start),
+                "scan": {
+                    "entry_limit": MAX_OVERVIEW_SCAN_ENTRIES,
+                    "scanned_entries": scanned_entries,
+                    "scanned_files": scanned_files,
+                    "scanned_directories": scanned_directories,
+                    "scanned_symlinks": scanned_symlinks,
+                    "complete": not scan_truncated,
+                    "truncated": scan_truncated,
+                    "truncation_reasons": scan_reasons,
+                },
+                "tree": {
+                    "max_depth": max_depth,
+                    "entry_limit": MAX_OVERVIEW_TREE_ENTRIES,
+                    "entries": list(tree_entries),
+                    "count": len(tree_entries),
+                    "truncated": (
+                        tree_depth_truncated
+                        or tree_entry_truncated
+                        or output_truncated["tree"]
+                    ),
+                    "output_truncated": output_truncated["tree"],
+                    "truncation_reasons": tree_reasons,
+                },
+                "anchors": {
+                    "limit": MAX_OVERVIEW_ANCHORS,
+                    "observed_count": len(all_anchors),
+                    "items": list(anchors),
+                    "count": len(anchors),
+                    "truncated": anchors_limited or output_truncated["anchors"],
+                    "output_truncated": output_truncated["anchors"],
+                    "truncation_reasons": anchor_reasons,
+                },
+                "directory_candidates": {
+                    "limit": MAX_OVERVIEW_DIRECTORY_CANDIDATES,
+                    "observed_count": len(directory_candidates),
+                    "items": list(directories),
+                    "count": len(directories),
+                    "truncated": (
+                        directories_limited
+                        or output_truncated["directory_candidates"]
+                    ),
+                    "output_truncated": output_truncated["directory_candidates"],
+                    "truncation_reasons": directory_reasons,
+                },
+                "extension_stats": {
+                    "limit": MAX_OVERVIEW_EXTENSION_STATS,
+                    "observed_count": len(extension_stats),
+                    "items": list(extensions),
+                    "count": len(extensions),
+                    "truncated": (
+                        extensions_limited or output_truncated["extension_stats"]
+                    ),
+                    "output_truncated": output_truncated["extension_stats"],
+                    "truncation_reasons": extension_reasons,
+                },
+                "data_char_limit": MAX_OVERVIEW_DATA_CHARS,
+                "serialized_chars": 0,
+                "truncated": bool(reasons),
+                "truncation_reasons": sorted(reasons),
+            }
+            while True:
+                measured = len(
+                    json.dumps(data, ensure_ascii=False, sort_keys=True)
+                )
+                if data["serialized_chars"] == measured:
+                    return data
+                data["serialized_chars"] = measured
+
+        while True:
+            data = build_data()
+            if data["serialized_chars"] <= MAX_OVERVIEW_DATA_CHARS:
+                return _success(data)
+            reasons.add("output_chars")
+            if tree_entries:
+                tree_entries.pop()
+                output_truncated["tree"] = True
+            elif directories:
+                directories.pop()
+                output_truncated["directory_candidates"] = True
+            elif extensions:
+                extensions.pop()
+                output_truncated["extension_stats"] = True
+            elif anchors:
+                anchors.pop()
+                output_truncated["anchors"] = True
+            else:
+                raise ToolInputError(
+                    "tool_error",
+                    "Repository overview metadata exceeds its output limit.",
+                )
 
     def _read_file(self, arguments: dict[str, Any]) -> ToolResult:
         _validate_fields(
@@ -985,35 +1357,12 @@ class ToolRegistry:
         )
 
     def _run_command(self, arguments: dict[str, Any]) -> ToolResult:
-        _validate_fields(
-            arguments,
-            allowed={"command", "cwd", "timeout_seconds"},
-            required={"command"},
+        command, cwd, timeout_seconds = self._validated_run_command_arguments(
+            arguments
         )
-        command = arguments.get("command")
-        if (
-            not isinstance(command, list)
-            or not command
-            or any(not isinstance(item, str) or "\x00" in item for item in command)
-            or not command[0]
-        ):
-            raise ToolInputError(
-                "invalid_arguments",
-                "command must be a non-empty array of strings",
-            )
-        cwd_value = _string_argument(arguments, "cwd", default=".")
-        timeout_seconds = _integer_argument(
-            arguments,
-            "timeout_seconds",
-            default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            minimum=1,
-            maximum=MAX_COMMAND_TIMEOUT_SECONDS,
-        )
-        cwd = self._workspace.resolve(cwd_value, expected="directory")
 
         started = time.perf_counter()
         try:
-            cwd = self._workspace.resolve(cwd_value, expected="directory")
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -1071,6 +1420,37 @@ class ToolRegistry:
                 data=data,
             )
         return _success(data)
+
+    def _validated_run_command_arguments(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[list[str], Path, int]:
+        _validate_fields(
+            arguments,
+            allowed={"command", "cwd", "timeout_seconds"},
+            required={"command"},
+        )
+        command = arguments.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or "\x00" in item for item in command)
+            or not command[0]
+        ):
+            raise ToolInputError(
+                "invalid_arguments",
+                "command must be a non-empty array of strings",
+            )
+        cwd_value = _string_argument(arguments, "cwd", default=".")
+        timeout_seconds = _integer_argument(
+            arguments,
+            "timeout_seconds",
+            default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            minimum=1,
+            maximum=MAX_COMMAND_TIMEOUT_SECONDS,
+        )
+        cwd = self._workspace.resolve(cwd_value, expected="directory")
+        return list(command), cwd, timeout_seconds
 
     def _terminate_and_collect(
         self,

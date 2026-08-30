@@ -10,10 +10,11 @@ import pytest
 
 import codeloop.agent.runner as runner_module
 import codeloop.interaction.cli as cli_module
+import codeloop.interaction.session as session_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent import PublicConversationTurn
 from codeloop.agent.runner import AgentRunner
-from codeloop.execution.tools import ToolRegistry
+from codeloop.execution.tools import ToolDefinition, ToolRegistry
 from codeloop.execution.workspace import Workspace
 from codeloop.interaction.session import (
     SESSION_TRUNCATION_MARKER,
@@ -752,6 +753,8 @@ def test_cli_task_is_optional_and_dispatches_interactive_mode(
 ) -> None:
     assert cli_module._parser().parse_args([]).task is None
     assert cli_module._parser().parse_args(["one shot"]).task == "one shot"
+    assert cli_module._parser().parse_args([]).max_steps == 30
+    assert cli_module._parser().parse_args(["--max-steps", "20"]).max_steps == 20
 
     monkeypatch.setenv("MODEL_API_KEY", "key")
     monkeypatch.setenv("MODEL_BASE_URL", "https://example.invalid")
@@ -794,3 +797,146 @@ def test_cli_one_shot_branch_keeps_original_message_shape(
     assert "done" in output.out
     assert "Stopped" not in output.out
     assert output.err == ""
+
+
+def _approval_test_registry(
+    tmp_path: Path,
+    dispatched: list[dict[str, Any]],
+) -> ToolRegistry:
+    registry = ToolRegistry(Workspace(tmp_path))
+    definition = registry._tools["run_command"]
+
+    def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        dispatched.append(arguments)
+        return {
+            "ok": True,
+            "data": {
+                "command": arguments["command"],
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+            },
+        }
+
+    registry._tools["run_command"] = ToolDefinition(definition.schema, handler)
+    return registry
+
+
+def _dependency_client() -> FakeClient:
+    return FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        "install",
+                        "run_command",
+                        json.dumps({"command": ["pip", "install", "numpy"]}),
+                    )
+                ]
+            ),
+            ModelResponse(text="Verification remains blocked."),
+        ]
+    )
+
+
+def test_interactive_dependency_confirmation_defaults_to_denial(
+    tmp_path: Path,
+) -> None:
+    client = _dependency_client()
+    output: list[str] = []
+    session = InteractiveSession(
+        client,
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=_input(["run tests", "", "/exit"]),
+        write_line=output.append,
+        renderer_factory=lambda: None,
+    )
+
+    assert session.run() == 0
+    observation = json.loads(client.calls[1]["messages"][-1]["content"])
+    assert observation["error_code"] == "user_denied"
+    assert "⚠ Dependency change" in output
+    assert any("pip install numpy" in line for line in output)
+
+
+@pytest.mark.parametrize("answer", ["y", "YES"])
+def test_interactive_dependency_confirmation_dispatches_after_yes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+) -> None:
+    dispatched: list[dict[str, Any]] = []
+    registry = _approval_test_registry(tmp_path, dispatched)
+    monkeypatch.setattr(
+        session_module,
+        "ToolRegistry",
+        lambda *_args, **_kwargs: registry,
+    )
+    session = InteractiveSession(
+        _dependency_client(),
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=_input(["run tests", answer, "/exit"]),
+        write_line=lambda _line: None,
+        renderer_factory=lambda: None,
+    )
+
+    assert session.run() == 0
+    assert len(dispatched) == 1
+
+
+def test_one_shot_dependency_confirmation_fails_closed_without_tty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _dependency_client()
+    monkeypatch.setenv("MODEL_API_KEY", "key")
+    monkeypatch.setenv("MODEL_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("MODEL_NAME", "fake")
+    monkeypatch.setattr(cli_module, "OpenAICompatibleClient", lambda **_kwargs: client)
+    monkeypatch.setattr(cli_module, "ConsoleRenderer", lambda: None)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+
+    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 0
+    observation = json.loads(client.calls[1]["messages"][-1]["content"])
+    assert observation["error_code"] == "approval_unavailable"
+    assert "Verification remains blocked." in capsys.readouterr().out
+
+
+def test_one_shot_tty_check_failure_is_non_interactive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenStdin:
+        def isatty(self) -> bool:
+            raise RuntimeError("TTY unavailable")
+
+    monkeypatch.setattr(cli_module.sys, "stdin", BrokenStdin())
+
+    assert cli_module._stdin_is_interactive() is False
+
+
+def test_one_shot_interactive_confirmation_is_injected_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _dependency_client()
+    dispatched: list[dict[str, Any]] = []
+    registry = _approval_test_registry(tmp_path, dispatched)
+    monkeypatch.setenv("MODEL_API_KEY", "key")
+    monkeypatch.setenv("MODEL_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("MODEL_NAME", "fake")
+    monkeypatch.setattr(cli_module, "OpenAICompatibleClient", lambda **_kwargs: client)
+    monkeypatch.setattr(cli_module, "ConsoleRenderer", lambda: None)
+    monkeypatch.setattr(cli_module, "ToolRegistry", lambda *_args, **_kwargs: registry)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module,
+        "ConsoleCommandApprover",
+        lambda: (lambda _request: True),
+    )
+
+    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 0
+    assert len(dispatched) == 1

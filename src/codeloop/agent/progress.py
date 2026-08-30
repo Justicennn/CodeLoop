@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
 from .plan import TaskPlan, UPDATE_PLAN_ACTION_NAME
+from .repository import UPDATE_WORKING_SET_ACTION_NAME
+from .review import UPDATE_REVIEW_FINDINGS_ACTION_NAME
 from .verification import VerificationStatus
 
 ProgressStatus = Literal["active", "possible_stall"]
@@ -34,12 +36,18 @@ _PROGRESS_INSTRUCTION = (
     "cosmetic plan updates to imitate progress."
 )
 _REVISION_SCOPED_TOOLS = {
+    "repository_overview",
     "list_files",
     "read_file",
     "search_code",
     "run_command",
 }
 _MUTATION_TOOLS = {"edit_file", "write_file", "make_directory"}
+_CORE_STATE_ACTIONS = {
+    UPDATE_PLAN_ACTION_NAME,
+    UPDATE_WORKING_SET_ACTION_NAME,
+    UPDATE_REVIEW_FINDINGS_ACTION_NAME,
+}
 
 
 @dataclass
@@ -172,7 +180,7 @@ class ProgressTracker:
 
     @staticmethod
     def _is_material_observation(action: ProgressAction) -> bool:
-        if action.name == UPDATE_PLAN_ACTION_NAME:
+        if action.name in _CORE_STATE_ACTIONS:
             return action.result.get("ok") is False
         if action.name in _MUTATION_TOOLS:
             data = _result_data(action.result)
@@ -206,7 +214,19 @@ def observation_digest(action: ProgressAction) -> str:
         "error_code": result.get("error_code"),
     }
 
-    if action.name == "list_files":
+    if action.name == "repository_overview":
+        projection["data"] = _select(
+            data,
+            "path",
+            "scan",
+            "tree",
+            "anchors",
+            "directory_candidates",
+            "extension_stats",
+            "truncated",
+            "truncation_reasons",
+        )
+    elif action.name == "list_files":
         projection["data"] = _select(
             data,
             "path",
@@ -260,6 +280,14 @@ def observation_digest(action: ProgressAction) -> str:
             projection["data"] = {"result": "successful_plan_action"}
         else:
             projection["data"] = _select(data, "changed_step_ids")
+    elif action.name in {
+        UPDATE_WORKING_SET_ACTION_NAME,
+        UPDATE_REVIEW_FINDINGS_ACTION_NAME,
+    }:
+        if result.get("ok") is True:
+            projection["data"] = {"result": "successful_core_state_action"}
+        else:
+            projection["data"] = _stable_error_data(data)
     else:
         projection["data"] = _stable_error_data(data)
 

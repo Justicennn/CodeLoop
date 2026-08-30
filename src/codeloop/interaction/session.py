@@ -10,10 +10,16 @@ from typing import Any
 
 from ..agent import PublicConversationTurn
 from ..agent.context import DEFAULT_MAX_CONTEXT_CHARS, DEFAULT_MAX_CONTEXT_MESSAGES
-from ..agent.runner import AgentResult, AgentRunner, TerminationReason
+from ..agent.runner import (
+    DEFAULT_MAX_STEPS,
+    AgentResult,
+    AgentRunner,
+    TerminationReason,
+)
 from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import ModelClient
+from .approval import ConsoleCommandApprover
 from .console import ConsoleRenderer
 from .narration import _NarratingModelClient
 
@@ -119,7 +125,7 @@ class InteractiveSession:
         model_name: str,
         workspace: Workspace,
         sensitive_values: tuple[str, ...] = (),
-        max_steps: int = 20,
+        max_steps: int = DEFAULT_MAX_STEPS,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
         read_line: Callable[[str], str] | None = None,
@@ -136,6 +142,10 @@ class InteractiveSession:
         self._read_line = read_line or input
         self._write_line = write_line or print
         self._renderer_factory = renderer_factory or _new_renderer
+        self._command_approver = ConsoleCommandApprover(
+            read_line=self._read_line,
+            write_line=self._write_line,
+        )
         self._history = SessionHistory()
 
     @property
@@ -264,6 +274,7 @@ class InteractiveSession:
             max_context_chars=self._max_context_chars,
             max_context_messages=self._max_context_messages,
             on_tool_event=renderer.show_tool_event if renderer is not None else None,
+            on_command_approval=self._command_approver,
             on_model_request_started=(
                 renderer.start_thinking if renderer is not None else None
             ),

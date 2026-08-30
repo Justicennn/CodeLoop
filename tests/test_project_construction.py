@@ -88,7 +88,8 @@ def test_make_directory_nested_existing_and_registered_schema(
     assert root_noop["data"]["path"] == "."
     assert root_noop["data"]["workspace_changed"] is False
     assert workspace.root == original_root
-    assert len(registry.schemas) == 7
+    assert len(registry.schemas) == 8
+    assert "repository_overview" in registry.names
     assert "make_directory" in registry.names
 
 
@@ -486,4 +487,3 @@ def test_partial_failure_increments_revision_and_still_repeats(
     assert first_observation["ok"] is False
     assert first_observation["data"]["workspace_changed"] is True
     assert first_observation["data"]["created_directories"] == ["src"]
-
