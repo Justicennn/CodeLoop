@@ -1,16 +1,25 @@
 """Agent Core public surface."""
 
 from .conversation import PublicConversationTurn
-from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
+from .events import (
+    CommandApprovalHandler,
+    ModelRequestHandler,
+    ToolEvent,
+    ToolEventHandler,
+)
 from .plan import PlanStatus, PlanStep, TaskPlan
 from .progress import ProgressState, ProgressStatus, ProgressTracker
-from .runner import AgentResult, AgentRunner, TerminationReason
+from .repository import RepositoryWorkingSet, WorkingSetEntry
+from .review import FindingEvidence, ReviewFinding, ReviewState
+from .runner import DEFAULT_MAX_STEPS, AgentResult, AgentRunner, TerminationReason
 from .task_state import PlanOutcome, TaskState
 from .verification import VerificationAttempt, VerificationState, VerificationStatus
 
 __all__ = [
     "AgentResult",
     "AgentRunner",
+    "CommandApprovalHandler",
+    "DEFAULT_MAX_STEPS",
     "ModelRequestHandler",
     "PlanStatus",
     "PlanOutcome",
@@ -19,6 +28,9 @@ __all__ = [
     "ProgressStatus",
     "ProgressTracker",
     "PublicConversationTurn",
+    "RepositoryWorkingSet",
+    "ReviewFinding",
+    "ReviewState",
     "TaskPlan",
     "TaskState",
     "TerminationReason",
@@ -27,4 +39,6 @@ __all__ = [
     "VerificationAttempt",
     "VerificationState",
     "VerificationStatus",
+    "FindingEvidence",
+    "WorkingSetEntry",
 ]

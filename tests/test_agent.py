@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from copy import deepcopy
+from inspect import signature
 from io import StringIO
 from pathlib import Path
 from shutil import copytree
@@ -17,7 +18,12 @@ import codeloop.execution.tools as tools_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.events import ToolEvent
 from codeloop.agent.prompt import SYSTEM_PROMPT
-from codeloop.agent.runner import AgentResult, AgentRunner, _FailureTracker
+from codeloop.agent.runner import (
+    DEFAULT_MAX_STEPS,
+    AgentResult,
+    AgentRunner,
+    _FailureTracker,
+)
 from codeloop.execution.tools import MAX_TEXT_CHARS, ToolRegistry
 from codeloop.execution.workspace import Workspace, WorkspaceError
 from codeloop.interaction.console import (
@@ -450,6 +456,11 @@ def test_max_steps_remains_an_independent_limit(tmp_path: Path) -> None:
     assert len(client.calls) == 3
 
 
+def test_default_max_steps_is_shared_and_raised_to_thirty() -> None:
+    assert DEFAULT_MAX_STEPS == 30
+    assert signature(AgentRunner).parameters["max_steps"].default == 30
+
+
 def test_command_timeout_terminates_and_reaps_direct_child(
     tmp_path: Path,
 ) -> None:
@@ -805,6 +816,24 @@ def test_failure_observation_repair_verify_loop(
     renderer.show_tool_event(
         ToolEvent(
             tool_call=ToolCall(
+                id="overview",
+                name="repository_overview",
+                arguments="{}",
+            ),
+            result={
+                "ok": True,
+                "data": {
+                    "path": ".",
+                    "anchors": {"items": ["AGENTS.md"]},
+                },
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
                 id="many-files",
                 name="list_files",
                 arguments="{}",
@@ -1032,6 +1061,8 @@ def test_failure_observation_repair_verify_loop(
     assert "file_0.py" not in bounded_output
     assert "file_4.py" not in bounded_output
     assert "file_5.py" not in bounded_output
+    assert "repository_overview" not in bounded_output
+    assert "AGENTS.md" not in bounded_output
     assert "✗ read_file · missing.py · file_not_found" in bounded_output
     assert "Path does not exist: missing.py" in bounded_output
     assert "✓ Created assets" in bounded_output
@@ -1226,6 +1257,42 @@ def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
     assert "complete and coherent core answer" in prompt
     assert "Expand fully when detail is explicitly requested" in prompt
     assert "Always disclose important failures" in prompt
+    assert "Dependency and environment changes are user-controlled" in prompt
+    assert "without explicit user approval" in prompt
+    assert "After user_denied" in prompt
+    assert "After approval_unavailable" in prompt
+    assert (
+        "Simple localized tasks with a clear path do not require an overview or "
+        "working set" in prompt
+    )
+
+
+def test_runner_exposes_the_existing_action_schema_order_unchanged(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient([ModelResponse(text="done")])
+
+    result = AgentRunner(
+        client,
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("Answer a simple question")
+
+    assert result.status == "completed"
+    assert [
+        schema["function"]["name"] for schema in client.calls[0]["tools"]
+    ] == [
+        "update_plan",
+        "update_working_set",
+        "update_review_findings",
+        "repository_overview",
+        "list_files",
+        "read_file",
+        "search_code",
+        "edit_file",
+        "write_file",
+        "make_directory",
+        "run_command",
+    ]
 
 
 def test_api_retry_classification_and_exhaustion(

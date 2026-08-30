@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from time import perf_counter, sleep
 from typing import Any, Literal
 
+from ..execution.command_policy import CommandApprovalRequest
 from ..execution.tools import ToolRegistry, ToolResult
 from ..model.client import ModelAPIError, ModelClient, ModelResponse, ToolCall
 from .context import (
@@ -17,7 +18,12 @@ from .context import (
     ConversationContext,
 )
 from .conversation import PublicConversationTurn
-from .events import ModelRequestHandler, ToolEvent, ToolEventHandler
+from .events import (
+    CommandApprovalHandler,
+    ModelRequestHandler,
+    ToolEvent,
+    ToolEventHandler,
+)
 from .plan import (
     PlanStep,
     UPDATE_PLAN_ACTION_NAME,
@@ -26,6 +32,16 @@ from .plan import (
 )
 from .prompt import SYSTEM_PROMPT
 from .progress import ProgressAction, ProgressFacts, ProgressTracker
+from .repository import (
+    UPDATE_WORKING_SET_ACTION_NAME,
+    UPDATE_WORKING_SET_SCHEMA,
+    apply_working_set_action,
+)
+from .review import (
+    UPDATE_REVIEW_FINDINGS_ACTION_NAME,
+    UPDATE_REVIEW_FINDINGS_SCHEMA,
+    apply_review_findings_action,
+)
 from .task_state import PlanOutcome, TaskState
 from .verification import VerificationAttempt, VerificationStatus
 
@@ -40,7 +56,15 @@ TerminationReason = Literal[
 ]
 MODEL_REQUEST_ATTEMPTS = 3
 MODEL_RETRY_DELAYS = (0.5, 1.0)
+DEFAULT_MAX_STEPS = 30
 MAX_CONFIGURED_STEPS = 100
+_CORE_ACTION_NAMES = frozenset(
+    {
+        UPDATE_PLAN_ACTION_NAME,
+        UPDATE_WORKING_SET_ACTION_NAME,
+        UPDATE_REVIEW_FINDINGS_ACTION_NAME,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -120,10 +144,11 @@ class AgentRunner:
         client: ModelClient,
         *,
         tools: ToolRegistry,
-        max_steps: int = 20,
+        max_steps: int = DEFAULT_MAX_STEPS,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
         on_tool_event: ToolEventHandler | None = None,
+        on_command_approval: CommandApprovalHandler | None = None,
         on_model_request_started: ModelRequestHandler | None = None,
         on_model_request_finished: ModelRequestHandler | None = None,
     ) -> None:
@@ -137,18 +162,27 @@ class AgentRunner:
         self._max_context_chars = max_context_chars
         self._max_context_messages = max_context_messages
         self._on_tool_event = on_tool_event
+        self._on_command_approval = on_command_approval
         self._on_model_request_started = on_model_request_started
         self._on_model_request_finished = on_model_request_finished
         execution_schemas = self._tools.schemas
-        if UPDATE_PLAN_ACTION_NAME in self._tools.names or any(
-            schema.get("function", {}).get("name") == UPDATE_PLAN_ACTION_NAME
+        collisions = set(_CORE_ACTION_NAMES.intersection(self._tools.names))
+        collisions.update(
+            schema.get("function", {}).get("name")
             for schema in execution_schemas
-        ):
+            if schema.get("function", {}).get("name") in _CORE_ACTION_NAMES
+        )
+        if collisions:
             raise ValueError(
-                "Execution ToolRegistry cannot register reserved action: "
-                f"{UPDATE_PLAN_ACTION_NAME}"
+                "Execution ToolRegistry cannot register reserved action(s): "
+                + ", ".join(sorted(collisions))
             )
-        self._action_schemas = [UPDATE_PLAN_SCHEMA, *execution_schemas]
+        self._action_schemas = [
+            UPDATE_PLAN_SCHEMA,
+            UPDATE_WORKING_SET_SCHEMA,
+            UPDATE_REVIEW_FINDINGS_SCHEMA,
+            *execution_schemas,
+        ]
 
     def run(
         self,
@@ -207,19 +241,54 @@ class AgentRunner:
                 for tool_call in response.tool_calls:
                     dispatch_started = perf_counter()
                     plan_before = task_state.plan
+                    approval_blocked = False
                     if tool_call.name == UPDATE_PLAN_ACTION_NAME:
                         result = apply_plan_action(task_state, tool_call.arguments)
+                    elif tool_call.name == UPDATE_WORKING_SET_ACTION_NAME:
+                        result = apply_working_set_action(
+                            task_state,
+                            tool_call.arguments,
+                        )
+                    elif tool_call.name == UPDATE_REVIEW_FINDINGS_ACTION_NAME:
+                        result = apply_review_findings_action(
+                            task_state,
+                            tool_call.arguments,
+                        )
                     else:
-                        result = self._tools.dispatch(
+                        approval_request = self._tools.command_approval_request(
                             tool_call.name,
                             tool_call.arguments,
+                        )
+                        approval_result = self._approval_result(approval_request)
+                        if approval_result is None:
+                            result = self._tools.dispatch(
+                                tool_call.name,
+                                tool_call.arguments,
+                            )
+                        else:
+                            result = approval_result
+                            approval_blocked = True
+                        task_state.record_execution_evidence(
+                            tool_name=tool_call.name,
+                            result=result,
                         )
                         if self._tools.confirmed_workspace_change(
                             tool_call.name,
                             result,
                         ):
-                            task_state.record_workspace_change()
-                        if tool_call.name == "run_command":
+                            data = result.get("data")
+                            changed_path = (
+                                data.get("path")
+                                if (
+                                    tool_call.name in {"edit_file", "write_file"}
+                                    and isinstance(data, dict)
+                                )
+                                else None
+                            )
+                            task_state.record_workspace_change(
+                                changed_path if isinstance(changed_path, str) else None
+                            )
+                        if tool_call.name == "run_command" and not approval_blocked:
                             task_state.record_run_command(
                                 model_step=step,
                                 result=result,
@@ -247,7 +316,7 @@ class AgentRunner:
                         }
                     )
                     if (
-                        tool_call.name != UPDATE_PLAN_ACTION_NAME
+                        tool_call.name not in _CORE_ACTION_NAMES
                         and self._on_tool_event is not None
                     ):
                         _notify_presentation(
@@ -259,7 +328,7 @@ class AgentRunner:
                                 truncated=_tool_result_is_truncated(result),
                             )
                         )
-                    if failures.record(tool_call, result):
+                    if not approval_blocked and failures.record(tool_call, result):
                         return self._result(
                             task_state,
                             status="repeated_failure",
@@ -301,7 +370,6 @@ class AgentRunner:
                             f"Maximum model decisions reached: {self._max_steps}."
                         ),
                     )
-
             return self._result(
                 task_state,
                 status="max_steps",
@@ -333,6 +401,50 @@ class AgentRunner:
                 steps=current_step,
                 message="An unexpected internal runtime error occurred.",
             )
+
+    def _approval_result(
+        self,
+        request: CommandApprovalRequest | None,
+    ) -> ToolResult | None:
+        if request is None:
+            return None
+        data = {
+            "command": list(request.command),
+            "category": request.category,
+        }
+        if self._on_command_approval is None:
+            return {
+                "ok": False,
+                "error_code": "approval_unavailable",
+                "message": (
+                    "The dependency-changing command was not executed because "
+                    "user approval was unavailable."
+                ),
+                "data": data,
+            }
+        try:
+            approved = self._on_command_approval(request)
+        except Exception:
+            return {
+                "ok": False,
+                "error_code": "approval_unavailable",
+                "message": (
+                    "The dependency-changing command was not executed because "
+                    "user approval was unavailable."
+                ),
+                "data": data,
+            }
+        if approved is True:
+            return None
+        return {
+            "ok": False,
+            "error_code": "user_denied",
+            "message": (
+                "The dependency-changing command was not executed because the "
+                "user did not approve it."
+            ),
+            "data": data,
+        }
 
     @staticmethod
     def _result(

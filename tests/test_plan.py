@@ -415,7 +415,7 @@ def test_plan_guided_react_preserves_multi_action_cycles(
     ]
     assert schema_names[0] == UPDATE_PLAN_ACTION_NAME
     assert schema_names.count(UPDATE_PLAN_ACTION_NAME) == 1
-    assert len(schema_names) == 8
+    assert len(schema_names) == 11
 
 
 def test_agent_result_exposes_blocked_plan_facts(tmp_path: Path) -> None:

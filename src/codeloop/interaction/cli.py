@@ -11,6 +11,7 @@ from pathlib import Path
 from ..agent.runner import (
     AgentResult,
     AgentRunner,
+    DEFAULT_MAX_STEPS,
     MAX_CONFIGURED_STEPS,
     TerminationReason,
 )
@@ -25,6 +26,7 @@ from ..agent.context import (
 from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import OpenAICompatibleClient
+from .approval import ConsoleCommandApprover
 from .console import ConsoleRenderer
 from .narration import _NarratingModelClient
 from .session import InteractiveSession
@@ -131,7 +133,12 @@ def _parser() -> argparse.ArgumentParser:
         default=".",
         help="Workspace directory (default: current directory)",
     )
-    parser.add_argument("--max-steps", type=_bounded_max_steps, default=20)
+    parser.add_argument(
+        "--max-steps",
+        type=_bounded_max_steps,
+        default=DEFAULT_MAX_STEPS,
+        help=f"Maximum model decisions (default: {DEFAULT_MAX_STEPS})",
+    )
     parser.add_argument(
         "--max-context-chars",
         type=_bounded_context_chars,
@@ -209,6 +216,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_context_chars=args.max_context_chars,
             max_context_messages=args.max_context_messages,
             on_tool_event=renderer.show_tool_event if renderer is not None else None,
+            on_command_approval=(
+                ConsoleCommandApprover() if _stdin_is_interactive() else None
+            ),
             on_model_request_started=(
                 renderer.start_thinking if renderer is not None else None
             ),
@@ -229,6 +239,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if renderer is None or not _render_best_effort(renderer.show_result, result):
         _show_fallback_result(result)
     return EXIT_CODES[result.status]
+
+
+def _stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":

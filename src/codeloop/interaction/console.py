@@ -24,7 +24,9 @@ TRUNCATION_MARKER = "... output truncated ..."
 FAILURE_EVIDENCE_CHARS = FAILURE_OUTPUT_LIMIT
 SUCCESS_EVIDENCE_CHARS = SUCCESS_OUTPUT_LIMIT
 OUTPUT_TRUNCATION_MARKER = TRUNCATION_MARKER
-_READ_ONLY_TOOLS = frozenset({"list_files", "read_file", "search_code"})
+_READ_ONLY_TOOLS = frozenset(
+    {"repository_overview", "list_files", "read_file", "search_code"}
+)
 
 
 class _TerminalNativeSyntaxTheme(SyntaxTheme):
