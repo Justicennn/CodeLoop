@@ -22,6 +22,7 @@ from codeloop.interaction.session import (
     parse_natural_workspace_switch,
     parse_workspace_argument,
 )
+from codeloop.interaction.narration import _NarratingModelClient
 from codeloop.model.client import ModelAPIError, ModelResponse, ToolCall
 
 
@@ -239,7 +240,65 @@ def test_interactive_tasks_receive_only_bounded_public_results(
         {"role": "user", "content": "second task"},
     ]
     assert all(message.get("role") != "tool" for message in second)
-    assert any("CodeLoop interactive" in line for line in output)
+    assert "CodeLoop · fake" in output
+    assert f"Workspace: {tmp_path.resolve()}" in output
+    assert "Type /help for commands." in output
+    assert "✓ Done · 1 steps\n\nfirst answer" in output
+    assert "✓ Done · 1 steps\n\nsecond answer" in output
+    assert all("Verified" not in line for line in output)
+
+
+def test_interactive_prompt_is_compact(tmp_path: Path) -> None:
+    prompts: list[str] = []
+    values = iter(["/exit"])
+
+    def read_line(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(values)
+
+    session = InteractiveSession(
+        FakeClient([]),
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=read_line,
+        write_line=lambda _line: None,
+        renderer_factory=lambda: None,
+    )
+
+    assert session.run() == 0
+    assert prompts == ["> "]
+
+
+def test_redundant_codeloop_invocation_is_not_a_task_or_history_turn(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient([ModelResponse(text="real answer")])
+    output: list[str] = []
+    session = InteractiveSession(
+        client,
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=_input(
+            [
+                f'CodeLoop --workspace "{tmp_path}"',
+                "codeloop项目是什么",
+                "/exit",
+            ]
+        ),
+        write_line=output.append,
+        renderer_factory=lambda: None,
+    )
+
+    assert session.run() == 0
+    assert len(client.calls) == 1
+    assert client.calls[0]["messages"][-1] == {
+        "role": "user",
+        "content": "codeloop项目是什么",
+    }
+    serialized = json.dumps(client.calls[0]["messages"], ensure_ascii=False)
+    assert "CodeLoop --workspace" not in serialized
+    assert "Already in interactive mode." in output
+    assert "Use /workspace ABSOLUTE_PATH to switch projects." in output
 
 
 def test_each_task_gets_a_fresh_renderer_and_empty_input_is_ignored(
@@ -553,6 +612,140 @@ def test_previous_turns_are_frozen_across_api_retry(
     assert client.calls[1]["tools"] == client.calls[2]["tools"]
 
 
+def test_public_narration_is_emitted_once_after_retry_and_kept_in_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(runner_module, "sleep", lambda _seconds: None)
+    retry = ModelAPIError(
+        "temporary",
+        "retry",
+        classification="retryable",
+    )
+    narration = "我先确认当前目录结构。"
+    client = FakeClient(
+        [
+            retry,
+            retry,
+            ModelResponse(
+                text=narration,
+                tool_calls=[ToolCall("list", "list_files", "{}")],
+            ),
+            ModelResponse(text="检查完成。"),
+        ]
+    )
+    observed: list[str] = []
+    result = AgentRunner(
+        _NarratingModelClient(client, observed.append),
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("检查项目")
+
+    assert result.status == "completed"
+    assert observed == [narration]
+    assert len(client.calls) == 4
+    assistant = client.calls[3]["messages"][-2]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == narration
+    assert assistant["tool_calls"][0]["id"] == "list"
+
+
+def test_narration_observer_is_optional_and_cannot_change_decision(
+    tmp_path: Path,
+) -> None:
+    narration = "我先读取必要信息。"
+    decision = ModelResponse(
+        text=narration,
+        tool_calls=[ToolCall("list", "list_files", "{}")],
+    )
+    direct_client = FakeClient([decision])
+    calls: list[str] = []
+
+    def broken_observer(text: str) -> None:
+        calls.append(text)
+        raise RuntimeError("presentation failed")
+
+    returned = _NarratingModelClient(
+        direct_client,
+        broken_observer,
+    ).complete([], [])
+    assert returned is decision
+    assert calls == [narration]
+
+    runtime_client = FakeClient([decision, ModelResponse(text="完成。")])
+    result = AgentRunner(
+        _NarratingModelClient(runtime_client, broken_observer),
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("检查")
+    assert result.status == "completed"
+    assert result.answer == "完成。"
+    assert calls == [narration, narration]
+    assert runtime_client.calls[1]["messages"][-2]["content"] == narration
+    assert (
+        runtime_client.calls[1]["messages"][-2]["tool_calls"][0]["id"]
+        == "list"
+    )
+
+    failed_observations: list[str] = []
+    failed_client = FakeClient(
+        [ModelAPIError("fatal", "fatal", classification="fatal")]
+    )
+    with pytest.raises(ModelAPIError):
+        _NarratingModelClient(
+            failed_client,
+            failed_observations.append,
+        ).complete([], [])
+    assert failed_observations == []
+
+    silent_client = FakeClient(
+        [
+            ModelResponse(tool_calls=[ToolCall("list", "list_files", "{}")]),
+            ModelResponse(text="完成。"),
+        ]
+    )
+    silent_observations: list[str] = []
+    result = AgentRunner(
+        _NarratingModelClient(silent_client, silent_observations.append),
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("检查")
+    assert result.status == "completed"
+    assert silent_observations == []
+
+
+def test_public_narration_is_plain_fallback_only_and_not_session_history(
+    tmp_path: Path,
+) -> None:
+    narration = "我先查看当前文件。"
+    client = FakeClient(
+        [
+            ModelResponse(
+                text=narration,
+                tool_calls=[ToolCall("list", "list_files", "{}")],
+            ),
+            ModelResponse(text="第一轮完成。"),
+            ModelResponse(text="第二轮完成。"),
+        ]
+    )
+    output: list[str] = []
+    session = InteractiveSession(
+        client,
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=_input(["first", "second", "/exit"]),
+        write_line=output.append,
+        renderer_factory=lambda: None,
+    )
+
+    assert session.run() == 0
+    assert output.count(narration) == 1
+    second_request = client.calls[2]["messages"]
+    assert second_request[1:] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "第一轮完成。"},
+        {"role": "user", "content": "second"},
+    ]
+    assert narration not in json.dumps(second_request, ensure_ascii=False)
+
+
 def test_cli_task_is_optional_and_dispatches_interactive_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -581,6 +774,7 @@ def test_cli_task_is_optional_and_dispatches_interactive_mode(
 def test_cli_one_shot_branch_keeps_original_message_shape(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeClient([ModelResponse(text="done")])
     monkeypatch.setenv("MODEL_API_KEY", "key")
@@ -595,3 +789,8 @@ def test_cli_one_shot_branch_keeps_original_message_shape(
         "user",
     ]
     assert client.calls[0]["messages"][-1]["content"] == "one shot"
+    output = capsys.readouterr()
+    assert "✓ Done · 1 steps" in output.out
+    assert "done" in output.out
+    assert "Stopped" not in output.out
+    assert output.err == ""

@@ -26,6 +26,7 @@ from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import OpenAICompatibleClient
 from .console import ConsoleRenderer
+from .narration import _NarratingModelClient
 from .session import InteractiveSession
 
 EXIT_CODES: dict[TerminationReason, int] = {
@@ -41,12 +42,25 @@ EXIT_CODES: dict[TerminationReason, int] = {
 
 def _show_fallback_result(result: AgentResult) -> None:
     if result.status == "completed":
-        print(f"[final] {result.answer}")
-    fields = [f"status={result.status}", f"steps={result.steps}"]
+        print(f"✓ Done · {result.steps} steps")
+        if result.verification_status == "verified":
+            print("✓ Verified")
+        elif result.verification_status == "unverified":
+            print("⚠ Unverified")
+        if result.answer:
+            print()
+            print(result.answer)
+        return
+    print(f"✗ Stopped · {result.status}", file=sys.stderr)
     if result.message:
-        fields.append(f"message={result.message}")
-    output = f"[termination] {' '.join(fields)}"
-    print(output, file=sys.stdout if result.status == "completed" else sys.stderr)
+        print(result.message, file=sys.stderr)
+
+
+def _show_plain_narration(text: str) -> None:
+    narration = text.strip()
+    if narration:
+        print(narration)
+        print()
 
 
 def _render_best_effort(
@@ -176,9 +190,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception:
             renderer = None
         if renderer is not None:
-            _render_best_effort(renderer.show_header, model, workspace.root, args.task)
-        result = AgentRunner(
+            _render_best_effort(
+                renderer.show_header,
+                model,
+                workspace.root,
+                args.task,
+            )
+        presented_client = _NarratingModelClient(
             client,
+            getattr(renderer, "show_narration", None)
+            if renderer is not None
+            else _show_plain_narration,
+        )
+        result = AgentRunner(
+            presented_client,
             tools=registry,
             max_steps=args.max_steps,
             max_context_chars=args.max_context_chars,

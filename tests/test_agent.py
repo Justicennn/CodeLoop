@@ -16,12 +16,11 @@ import codeloop.agent.runner as agent_module
 import codeloop.execution.tools as tools_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.events import ToolEvent
-from codeloop.agent.runner import AgentRunner, _FailureTracker
+from codeloop.agent.prompt import SYSTEM_PROMPT
+from codeloop.agent.runner import AgentResult, AgentRunner, _FailureTracker
 from codeloop.execution.tools import MAX_TEXT_CHARS, ToolRegistry
 from codeloop.execution.workspace import Workspace, WorkspaceError
 from codeloop.interaction.console import (
-    DIFF_PREVIEW_CHARS,
-    DIFF_TRUNCATION_MARKER,
     FAILURE_EVIDENCE_CHARS,
     OUTPUT_TRUNCATION_MARKER,
     SUCCESS_EVIDENCE_CHARS,
@@ -765,9 +764,9 @@ def test_failure_observation_repair_verify_loop(
     assert "CodeLoop · test-model" in output
     assert str(workspace_path) in output
     assert "Workspace:" not in output
-    assert output.count("● Files") == 1
-    assert output.index("discount.py") < output.index("README.md")
-    assert output.index("README.md") < output.index("test_discount.py")
+    assert "● Files" not in output
+    assert "README.md" not in output
+    assert "test_discount.py" not in output
     assert "Reading discount.py" not in output
     assert "Running command" not in output
     assert "FAILED" in output
@@ -775,27 +774,23 @@ def test_failure_observation_repair_verify_loop(
     assert "Traceback" not in output
     assert 'File "' not in output
     assert "OK" in output
-    assert "◆ discount.py" in output
-    assert "-discount_amount = subtotal * discount_percent" in output
-    assert "+discount_amount = subtotal * (discount_percent / 100)" in output
+    assert "◆ Updated discount.py · 1 replacement" in output
+    assert "-discount_amount = subtotal * discount_percent" not in output
+    assert "+discount_amount = subtotal * (discount_percent / 100)" not in output
     assert "--- a/discount.py" not in output
     assert "+++ b/discount.py" not in output
     assert "@@" not in output
     assert "Applied 1 replacement" not in output
     assert "Done · 5 steps" in output
-    assert "Changed discount.py" in output
+    assert "✓ Verified" in output
+    assert output.count("Changed discount.py") == 1
     assert "Last command" not in output
     assert "Last successful command" not in output
     assert "unittest -v" in output
     assert "Final answer" not in output
     assert "discounted_total(100, 10)" in output
     assert "print('theme neutral')" in output
-    separator_lines = [
-        line
-        for line in output.splitlines()
-        if line and set(line) == {"─"}
-    ]
-    assert separator_lines == ["─" * 80]
+    assert "─" * 80 not in output
     assert "[observation]" not in output
     assert "dispatch_duration_ms=" not in output
     assert "ms)" not in output
@@ -853,7 +848,7 @@ def test_failure_observation_repair_verify_loop(
                     "command": ["python", "check.py"],
                     "exit_code": 0,
                     "stdout": "progress " + "x" * 600,
-                    "stderr": "Ran 2 tests\nOK",
+                    "stderr": "Ran 2 tests\n31 passed · 0 failed\nOK",
                 },
             },
             dispatch_duration_ms=7,
@@ -942,20 +937,111 @@ def test_failure_observation_repair_verify_loop(
             ),
             result={
                 "ok": True,
-                "data": {"path": "large.py", "replacements": 1},
+                "data": {
+                    "path": "large.py",
+                    "replacements": 1,
+                    "workspace_changed": True,
+                },
             },
             dispatch_duration_ms=1_200,
             truncated=False,
         )
     )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="failed-read-id",
+                name="read_file",
+                arguments='{"path":"missing.py"}',
+            ),
+            result={
+                "ok": False,
+                "error_code": "file_not_found",
+                "message": "Path does not exist: missing.py",
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="mkdir-created-id",
+                name="make_directory",
+                arguments='{"path":"assets"}',
+            ),
+            result={
+                "ok": True,
+                "data": {"path": "assets", "workspace_changed": True},
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="mkdir-ready-id",
+                name="make_directory",
+                arguments='{"path":"existing"}',
+            ),
+            result={
+                "ok": True,
+                "data": {"path": "existing", "workspace_changed": False},
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="write-id",
+                name="write_file",
+                arguments='{"path":"new.py","content":"x"}',
+            ),
+            result={
+                "ok": True,
+                "data": {"path": "new.py", "workspace_changed": True},
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="unchanged-edit-id",
+                name="edit_file",
+                arguments='{"path":"same.py","old_text":"x","new_text":"x"}',
+            ),
+            result={
+                "ok": True,
+                "data": {
+                    "path": "same.py",
+                    "replacements": 1,
+                    "workspace_changed": False,
+                },
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
     bounded_output = rendered.getvalue()
-    assert bounded_output.count("● Files") == 1
-    assert bounded_output.count("file_0.py") == 1
-    assert "file_4.py" in bounded_output
+    assert "● Files" not in bounded_output
+    assert "file_0.py" not in bounded_output
+    assert "file_4.py" not in bounded_output
     assert "file_5.py" not in bounded_output
-    assert "+1 more" in bounded_output
+    assert "✗ read_file · missing.py · file_not_found" in bounded_output
+    assert "Path does not exist: missing.py" in bounded_output
+    assert "✓ Created assets" in bounded_output
+    assert "✓ Directory ready existing" in bounded_output
+    assert "◆ Wrote new.py" in bounded_output
+    assert "◆ Created new.py" not in bounded_output
+    assert "◆ Updated new.py" not in bounded_output
+    assert "◆ Unchanged same.py" in bounded_output
     assert "Command details unavailable" not in bounded_output
-    assert "⚠ Command not executed · invalid_arguments" in bounded_output
+    assert "⚠ run_command · invalid_arguments" in bounded_output
     assert bounded_output.count(
         "command must be a non-empty array of strings"
     ) == 1
@@ -963,7 +1049,8 @@ def test_failure_observation_repair_verify_loop(
         not line.strip().startswith("Error:")
         for line in bounded_output.splitlines()
     )
-    assert "Ran 2 tests" in bounded_output
+    assert "Ran 2 tests" not in bounded_output
+    assert "31 passed · 0 failed" in bounded_output
     assert "OK" in bounded_output
     assert "progress " not in bounded_output
     assert "python check.py" in bounded_output
@@ -974,15 +1061,19 @@ def test_failure_observation_repair_verify_loop(
     assert 'File "test_demo.py"' not in bounded_output
     assert "FAIL: test_demo" not in bounded_output
     assert "fallback-one" not in bounded_output
-    assert "fallback-two" in bounded_output
-    assert "fallback-three" in bounded_output
-    assert "fallback-four" in bounded_output
-    assert "... diff truncated ..." in bounded_output
+    assert "fallback-two" not in bounded_output
+    assert "fallback-three" not in bounded_output
+    assert "fallback-four" not in bounded_output
     assert "---" not in bounded_output
     assert "+++" not in bounded_output
     assert "@@" not in bounded_output
-    assert "replacements" not in bounded_output
+    assert "◆ Updated large.py · 1 replacement" in bounded_output
     assert "(1.2s)" not in bounded_output
+    assert "workspace_changed" not in bounded_output
+    assert "write-id" not in bounded_output
+    assert '"ok"' not in bounded_output
+    assert "Thought" not in bounded_output
+    assert "Reason" not in bounded_output
     assert len(
         _bounded_text(
             "x" * (SUCCESS_EVIDENCE_CHARS + 1),
@@ -997,13 +1088,144 @@ def test_failure_observation_repair_verify_loop(
             OUTPUT_TRUNCATION_MARKER,
         )
     ) == FAILURE_EVIDENCE_CHARS
-    assert len(
-        _bounded_text(
-            "x" * (DIFF_PREVIEW_CHARS + 1),
-            DIFF_PREVIEW_CHARS,
-            DIFF_TRUNCATION_MARKER,
+
+
+def test_compact_result_uses_real_verification_and_termination_status() -> None:
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=200,
         )
-    ) == DIFF_PREVIEW_CHARS
+    )
+
+    renderer.show_result(
+        AgentResult(
+            status="completed",
+            answer="Model final answer.",
+            steps=3,
+            verification_status="unverified",
+        )
+    )
+    unverified = rendered.getvalue()
+    assert "✓ Done · 3 steps" in unverified
+    assert "⚠ Unverified" in unverified
+    assert "✓ Verified" not in unverified
+    assert "Model final answer." in unverified
+
+    rendered.seek(0)
+    rendered.truncate(0)
+    renderer.show_result(
+        AgentResult(
+            status="completed",
+            answer="Read-only final.",
+            steps=1,
+            verification_status="not_required",
+        )
+    )
+    not_required = rendered.getvalue()
+    assert "✓ Done · 1 steps" in not_required
+    assert "Verified" not in not_required
+    assert "Unverified" not in not_required
+
+    rendered.seek(0)
+    rendered.truncate(0)
+    renderer.show_result(
+        AgentResult(
+            status="no_progress",
+            answer=None,
+            steps=8,
+            message="No material progress was detected.",
+        )
+    )
+    stopped = rendered.getvalue()
+    assert "✗ Stopped · no_progress" in stopped
+    assert "No material progress was detected." in stopped
+    assert "Done" not in stopped
+
+
+def test_public_narration_and_detailed_final_are_rendered_without_inference() -> None:
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=4_000,
+        )
+    )
+    narration = "我先检查购买流程；如果验证失败，再调整找零策略。"
+    renderer.show_narration(narration)
+    detailed_final = "详细结果：" + "保留完整上下文。" * 300 + "FINAL_TAIL"
+    renderer.show_result(
+        AgentResult(status="completed", answer=detailed_final, steps=2)
+    )
+
+    output = rendered.getvalue()
+    assert output.count(narration) == 1
+    assert "Inspecting..." not in output
+    assert "Diagnosing..." not in output
+    assert "Planning..." not in output
+    assert "Thinking..." not in output
+    assert "详细结果：" in output
+    assert "FINAL_TAIL" in output
+
+
+def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
+    prompt = SYSTEM_PROMPT
+    assert (
+        "Public narration is optional, not a required response format" in prompt
+    )
+    assert "Producing no narration is always valid" in prompt
+    assert "Do not narrate every read, search, edit, or command" in prompt
+    assert "never provide private reasoning" in prompt
+    assert "Conversational presentation must not reduce execution depth" in prompt
+    assert "without mutating the Workspace unless the user asks" in prompt
+    assert (
+        "Determine advisory versus action-oriented behavior from the user's "
+        "complete intent and conversation context" in prompt
+    )
+    assert "never from keyword or phrase matching" in prompt
+    assert (
+        "examples of ordinary advisory requests only, not routing triggers"
+        in prompt
+    )
+    assert "execute that work with the necessary depth" in prompt
+    assert (
+        "Selective reporting changes final-answer breadth, not execution semantics"
+        in prompt
+    )
+    assert "Match the final answer's scope to the current question" in prompt
+    assert (
+        "one cohesive short paragraph or roughly two to five sentences"
+        in prompt
+    )
+    assert "non-exhaustive by default" in prompt
+    assert "Inspection depth and reporting breadth are independent" in prompt
+    assert "rank the discovered findings by importance" in prompt
+    assert "two to four findings that matter most" in prompt
+    assert (
+        "Do not automatically turn ordinary advice into a complete code review"
+        in prompt
+    )
+    assert "Avoid A/B/C/D or A1/A2 hierarchies" in prompt
+    assert "Detailed evidence such as code locations" in prompt
+    assert "is demand-driven" in prompt
+    assert "the final answer must cover every one of them" in prompt
+    assert "lead with what was actually changed" in prompt
+    assert "then the strongest real verification result" in prompt
+    assert "a few highest-value future directions" in prompt
+    assert "must never omit an executed major-task result" in prompt
+    assert "not a mandatory heading template" in prompt
+    assert (
+        "Tool evidence supports selection but does not all need to be repeated"
+        in prompt
+    )
+    assert "complete and coherent core answer" in prompt
+    assert "Expand fully when detail is explicitly requested" in prompt
+    assert "Always disclose important failures" in prompt
 
 
 def test_api_retry_classification_and_exhaustion(

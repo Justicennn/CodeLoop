@@ -15,6 +15,7 @@ from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import ModelClient
 from .console import ConsoleRenderer
+from .narration import _NarratingModelClient
 
 DEFAULT_MAX_SESSION_PAIRS = 6
 DEFAULT_MAX_SESSION_CHARS = 12_000
@@ -142,14 +143,14 @@ class InteractiveSession:
         return self._workspace
 
     def run(self) -> int:
-        self._write_line(
-            f"CodeLoop interactive · {self._model_name} · {self._workspace.root}"
-        )
-        self._write_line("Type /help for available commands.")
+        self._write_line(f"CodeLoop · {self._model_name}")
+        self._write_line(f"Workspace: {self._workspace.root}")
+        self._write_line("")
+        self._write_line("Type /help for commands.")
 
         while True:
             try:
-                raw = self._read_line("codeloop> ")
+                raw = self._read_line("> ")
             except EOFError:
                 return 0
             except KeyboardInterrupt:
@@ -164,6 +165,13 @@ class InteractiveSession:
             if command_result is not None:
                 if command_result >= 0:
                     return command_result
+                continue
+
+            if _is_redundant_codeloop_invocation(text):
+                self._write_line("Already in interactive mode.")
+                self._write_line(
+                    "Use /workspace ABSOLUTE_PATH to switch projects."
+                )
                 continue
 
             switch = parse_natural_workspace_switch(text)
@@ -241,8 +249,16 @@ class InteractiveSession:
             renderer = self._renderer_factory()
         except Exception:
             renderer = None
+        narration_callback = (
+            getattr(renderer, "show_narration", None)
+            if renderer is not None
+            else self._show_plain_narration
+        )
         runner = AgentRunner(
-            self._client,
+            _NarratingModelClient(
+                self._client,
+                narration_callback,
+            ),
             tools=registry,
             max_steps=self._max_steps,
             max_context_chars=self._max_context_chars,
@@ -260,6 +276,12 @@ class InteractiveSession:
             self._write_line(_fallback_result_text(result))
         self._history.add(task, _public_assistant_text(result))
         return result
+
+    def _show_plain_narration(self, text: str) -> None:
+        narration = text.strip()
+        if narration:
+            self._write_line(narration)
+            self._write_line("")
 
 
 def parse_workspace_argument(argument: str) -> Path | None:
@@ -370,9 +392,23 @@ def _public_assistant_text(result: AgentResult) -> str:
 
 def _fallback_result_text(result: AgentResult) -> str:
     if result.status == "completed":
-        return f"[final] {result.answer or ''}"
-    detail = f" message={result.message}" if result.message else ""
-    return f"[termination] status={result.status} steps={result.steps}{detail}"
+        lines = [f"✓ Done · {result.steps} steps"]
+        if result.verification_status == "verified":
+            lines.append("✓ Verified")
+        elif result.verification_status == "unverified":
+            lines.append("⚠ Unverified")
+        if result.answer:
+            lines.extend(("", result.answer))
+        return "\n".join(lines)
+    lines = [f"✗ Stopped · {result.status}"]
+    if result.message:
+        lines.append(result.message)
+    return "\n".join(lines)
+
+
+def _is_redundant_codeloop_invocation(value: str) -> bool:
+    command = value.split(maxsplit=1)[0]
+    return command.casefold() == "codeloop"
 
 
 def _new_renderer() -> ConsoleRenderer | None:
