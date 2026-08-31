@@ -21,6 +21,7 @@ MAX_REQUIREMENTS = 32
 MAX_REQUIREMENT_ID_CHARS = 64
 MAX_REQUIREMENT_DESCRIPTION_CHARS = 400
 MAX_REQUIREMENT_LOCATOR_CHARS = 160
+MAX_REQUIREMENT_URL_CHARS = 2_000
 
 _REQUIREMENT_KINDS = {"functional", "constraint", "acceptance", "reference"}
 
@@ -30,7 +31,7 @@ UPDATE_REQUIREMENTS_SCHEMA: dict[str, Any] = {
         "name": UPDATE_REQUIREMENTS_ACTION_NAME,
         "description": (
             "Replace the current task's bounded requirements extracted from "
-            "successfully read local source documents."
+            "successfully read local documents or explicit webpages."
         ),
         "parameters": {
             "type": "object",
@@ -63,13 +64,21 @@ UPDATE_REQUIREMENTS_SCHEMA: dict[str, Any] = {
                                         "minLength": 1,
                                         "maxLength": 1_000,
                                     },
+                                    "url": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": MAX_REQUIREMENT_URL_CHARS,
+                                    },
                                     "locator": {
                                         "type": "string",
                                         "minLength": 1,
                                         "maxLength": MAX_REQUIREMENT_LOCATOR_CHARS,
                                     },
                                 },
-                                "required": ["path"],
+                                "oneOf": [
+                                    {"required": ["path"]},
+                                    {"required": ["url"]},
+                                ],
                                 "additionalProperties": False,
                             },
                         },
@@ -94,24 +103,37 @@ class RequirementValidationError(Exception):
 
 @dataclass(frozen=True)
 class RequirementSource:
-    path: str
+    path: str | None = None
+    url: str | None = None
     locator: str | None = None
 
     def __post_init__(self) -> None:
-        normalized = normalize_workspace_relative_path(self.path)
-        if normalized != self.path:
+        if (self.path is None) == (self.url is None):
             raise RequirementValidationError(
                 "invalid_requirements",
-                "Requirement source paths must be normalized.",
+                "Requirement source requires exactly one path or url.",
             )
+        if self.path is not None:
+            normalized = normalize_workspace_relative_path(self.path)
+            if normalized != self.path:
+                raise RequirementValidationError(
+                    "invalid_requirements",
+                    "Requirement source paths must be normalized.",
+                )
+        if self.url is not None:
+            _text("source url", self.url, MAX_REQUIREMENT_URL_CHARS)
         if self.locator is not None:
             _text("source locator", self.locator, MAX_REQUIREMENT_LOCATOR_CHARS)
 
     def to_snapshot(self) -> dict[str, str]:
-        snapshot = {"path": self.path}
+        snapshot = (
+            {"path": self.path}
+            if self.path is not None
+            else {"url": self.url}
+        )
         if self.locator is not None:
             snapshot["locator"] = self.locator
-        return snapshot
+        return {key: value for key, value in snapshot.items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -192,13 +214,23 @@ def apply_requirements_action(
     try:
         arguments = _parse_arguments(arguments_json)
         requirements = _parse_requirements(arguments["requirements"])
-        eligible = set(task_state.read_source_paths)
+        eligible_paths = set(task_state.read_source_paths)
+        eligible_urls = set(task_state.read_source_urls)
         unobserved = sorted(
-            {
-                requirement.source.path
+            source
+            for source in {
+                requirement.source.path or requirement.source.url
                 for requirement in requirements
-                if requirement.source.path not in eligible
+                if (
+                    requirement.source.path is not None
+                    and requirement.source.path not in eligible_paths
+                )
+                or (
+                    requirement.source.url is not None
+                    and requirement.source.url not in eligible_urls
+                )
             }
+            if source is not None
         )
         if unobserved:
             raise RequirementValidationError(
@@ -297,18 +329,30 @@ def _parse_requirements(raw_requirements: list[Any]) -> tuple[Requirement, ...]:
 
 
 def _parse_source(raw: Any) -> RequirementSource:
-    if (
-        not isinstance(raw, dict)
-        or "path" not in raw
-        or set(raw) - {"path", "locator"}
-    ):
+    if not isinstance(raw, dict) or set(raw) - {"path", "url", "locator"}:
         raise RequirementValidationError(
             "invalid_arguments",
-            "Requirement source requires path and optional locator.",
+            "Requirement source requires exactly one path or url and optional locator.",
+        )
+    has_path = "path" in raw
+    has_url = "url" in raw
+    if has_path == has_url:
+        raise RequirementValidationError(
+            "invalid_arguments",
+            "Requirement source requires exactly one path or url.",
         )
     locator = raw.get("locator")
     return RequirementSource(
-        path=normalize_workspace_relative_path(raw["path"]),
+        path=(
+            normalize_workspace_relative_path(raw["path"])
+            if has_path
+            else None
+        ),
+        url=(
+            _text("source url", raw["url"], MAX_REQUIREMENT_URL_CHARS)
+            if has_url
+            else None
+        ),
         locator=(
             _text("source locator", locator, MAX_REQUIREMENT_LOCATOR_CHARS)
             if locator is not None

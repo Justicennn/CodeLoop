@@ -18,6 +18,8 @@ from typing import Any
 
 from .command_policy import CommandApprovalRequest, dependency_mutation_request
 from .document_sources import DocumentSourceError, extract_document
+from .source_text import SourceTextSliceError, bounded_text_slice
+from .web_sources import MAX_WEB_URL_CHARS, WebPageAdapter, WebSourceError
 from .workspace import Workspace, WorkspaceError
 
 ToolResult = dict[str, Any]
@@ -28,6 +30,7 @@ MAX_LIST_DEPTH = 8
 MAX_READ_LINES = 200
 MAX_TEXT_CHARS = 20_000
 MAX_DOCUMENT_CHARS = 20_000
+MAX_WEBPAGE_CHARS = 20_000
 MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 50
 MAX_OVERVIEW_PATH_CHARS = 1_000
@@ -395,6 +398,37 @@ READ_DOCUMENT_SCHEMA: dict[str, Any] = {
     },
 }
 
+READ_WEBPAGE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_webpage",
+        "description": (
+            "Read a bounded deterministic text range from an explicit HTTP or "
+            "HTTPS HTML, XHTML, or plain-text source. Continue with next_cursor "
+            "when truncated."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_WEB_URL_CHARS,
+                },
+                "cursor": {"type": "integer", "minimum": 0, "default": 0},
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WEBPAGE_CHARS,
+                    "default": MAX_WEBPAGE_CHARS,
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 SEARCH_CODE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -493,15 +527,17 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    """A direct registry of nine workspace-bound coding tools."""
+    """A direct registry of ten narrow coding tools."""
 
     def __init__(
         self,
         workspace: Workspace,
         *,
         sensitive_values: Iterable[str] = (),
+        webpage_adapter: WebPageAdapter | None = None,
     ) -> None:
         self._workspace = workspace
+        self._webpage_adapter = webpage_adapter or WebPageAdapter()
         self._sensitive_values = tuple(
             sorted(
                 {value for value in sensitive_values if value},
@@ -519,6 +555,10 @@ class ToolRegistry:
             "read_document": ToolDefinition(
                 READ_DOCUMENT_SCHEMA,
                 self._read_document,
+            ),
+            "read_webpage": ToolDefinition(
+                READ_WEBPAGE_SCHEMA,
+                self._read_webpage,
             ),
             "search_code": ToolDefinition(SEARCH_CODE_SCHEMA, self._search_code),
             "edit_file": ToolDefinition(
@@ -1032,33 +1072,99 @@ class ToolRegistry:
         except DocumentSourceError as exc:
             raise ToolInputError(exc.error_code, exc.message) from exc
 
-        total_chars = len(document.text)
-        if cursor > total_chars:
+        try:
+            source_slice = bounded_text_slice(
+                document.text,
+                cursor=cursor,
+                max_chars=max_chars,
+            )
+        except SourceTextSliceError as exc:
             raise ToolInputError(
                 "invalid_arguments",
                 "cursor cannot exceed the document's total_chars.",
-                data={"cursor": cursor, "total_chars": total_chars},
-            )
-        end_cursor = min(total_chars, cursor + max_chars)
-        truncated = end_cursor < total_chars
-        first_unit = document.locator_at(cursor) if cursor < end_cursor else None
+                data={"cursor": cursor, "total_chars": exc.total_chars},
+            ) from exc
+        first_unit = (
+            document.locator_at(source_slice.start_cursor)
+            if source_slice.start_cursor < source_slice.end_cursor
+            else None
+        )
         last_unit = (
-            document.locator_at(end_cursor - 1) if cursor < end_cursor else None
+            document.locator_at(source_slice.end_cursor - 1)
+            if source_slice.start_cursor < source_slice.end_cursor
+            else None
         )
         return _success(
             {
                 "path": self._workspace.relative_path(path),
                 "document_type": document.document_type,
-                "text": document.text[cursor:end_cursor],
+                "text": source_slice.text,
                 "position": {
-                    "start_cursor": cursor,
-                    "end_cursor": end_cursor,
-                    "total_chars": total_chars,
+                    "start_cursor": source_slice.start_cursor,
+                    "end_cursor": source_slice.end_cursor,
+                    "total_chars": source_slice.total_chars,
                     "first_unit": first_unit,
                     "last_unit": last_unit,
                 },
-                "truncated": truncated,
-                "next_cursor": end_cursor if truncated else None,
+                "truncated": source_slice.truncated,
+                "next_cursor": source_slice.next_cursor,
+            }
+        )
+
+    def _read_webpage(self, arguments: dict[str, Any]) -> ToolResult:
+        _validate_fields(
+            arguments,
+            allowed={"url", "cursor", "max_chars"},
+            required={"url"},
+        )
+        url = _string_argument(arguments, "url", allow_empty=False)
+        cursor = _integer_argument(
+            arguments,
+            "cursor",
+            default=0,
+            minimum=0,
+            maximum=2_147_483_647,
+        )
+        max_chars = _integer_argument(
+            arguments,
+            "max_chars",
+            default=MAX_WEBPAGE_CHARS,
+            minimum=1,
+            maximum=MAX_WEBPAGE_CHARS,
+        )
+        try:
+            webpage = self._webpage_adapter.extract(url)
+            source_slice = bounded_text_slice(
+                webpage.text,
+                cursor=cursor,
+                max_chars=max_chars,
+            )
+        except WebSourceError as exc:
+            raise ToolInputError(
+                exc.error_code,
+                exc.message,
+                data=exc.data,
+            ) from exc
+        except SourceTextSliceError as exc:
+            raise ToolInputError(
+                "invalid_arguments",
+                "cursor cannot exceed the webpage's total_chars.",
+                data={"cursor": cursor, "total_chars": exc.total_chars},
+            ) from exc
+        return _success(
+            {
+                "requested_url": webpage.requested_url,
+                "final_url": webpage.final_url,
+                "title": webpage.title,
+                "content_type": webpage.content_type,
+                "text": source_slice.text,
+                "position": {
+                    "start_cursor": source_slice.start_cursor,
+                    "end_cursor": source_slice.end_cursor,
+                    "total_chars": source_slice.total_chars,
+                },
+                "truncated": source_slice.truncated,
+                "next_cursor": source_slice.next_cursor,
             }
         )
 

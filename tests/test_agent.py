@@ -1289,6 +1289,7 @@ def test_runner_exposes_the_current_action_schema_order(
         "list_files",
         "read_file",
         "read_document",
+        "read_webpage",
         "search_code",
         "edit_file",
         "write_file",

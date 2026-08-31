@@ -30,6 +30,7 @@ _READ_ONLY_TOOLS = frozenset(
         "list_files",
         "read_file",
         "read_document",
+        "read_webpage",
         "search_code",
     }
 )

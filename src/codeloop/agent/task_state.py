@@ -30,6 +30,8 @@ _COMPLETION_REVIEW_INSTRUCTION = (
 )
 MAX_INSPECTED_EVIDENCE_PATHS = 512
 MAX_READ_SOURCE_PATHS = 128
+MAX_READ_SOURCE_URLS = 128
+MAX_READ_SOURCE_URL_CHARS = 2_000
 _TEXT_SOURCE_EXTENSIONS = {".txt", ".md", ".json", ".yaml", ".yml"}
 
 
@@ -46,6 +48,7 @@ class TaskState:
     requirements: RequirementState = field(default_factory=RequirementState)
     inspected_evidence_paths: tuple[str, ...] = ()
     read_source_paths: tuple[str, ...] = ()
+    read_source_urls: tuple[str, ...] = ()
     last_completion_review_fingerprint: CompletionReviewFingerprint | None = None
     pending_completion_review: dict[str, Any] | None = None
 
@@ -79,6 +82,26 @@ class TaskState:
                 "Read source paths must be unique.",
             )
         self.read_source_paths = normalized_sources
+        if len(self.read_source_urls) > MAX_READ_SOURCE_URLS:
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read source URLs exceed the task-local limit.",
+            )
+        if any(
+            not isinstance(url, str)
+            or not url
+            or len(url) > MAX_READ_SOURCE_URL_CHARS
+            for url in self.read_source_urls
+        ):
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read source URLs must be non-empty bounded strings.",
+            )
+        if len(set(self.read_source_urls)) != len(self.read_source_urls):
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read source URLs must be unique.",
+            )
 
     def replace_plan(self, plan: TaskPlan) -> None:
         self.plan = plan
@@ -95,7 +118,7 @@ class TaskState:
         tool_name: str,
         result: dict[str, Any],
     ) -> None:
-        """Remember only file paths backed by successful content observations."""
+        """Remember bounded evidence and source locators from successful reads."""
         if result.get("ok") is not True:
             return
         data = result.get("data")
@@ -127,6 +150,8 @@ class TaskState:
 
         source_path = data.get("path")
         if not isinstance(source_path, str):
+            if tool_name == "read_webpage":
+                self._record_web_source_urls(data)
             return
         if tool_name == "read_document":
             eligible_source = True
@@ -149,6 +174,21 @@ class TaskState:
             *self.read_source_paths,
             normalized_source,
         )[-MAX_READ_SOURCE_PATHS:]
+
+    def _record_web_source_urls(self, data: dict[str, Any]) -> None:
+        for key in ("requested_url", "final_url"):
+            url = data.get(key)
+            if (
+                not isinstance(url, str)
+                or not url
+                or len(url) > MAX_READ_SOURCE_URL_CHARS
+                or url in self.read_source_urls
+            ):
+                continue
+            self.read_source_urls = (
+                *self.read_source_urls,
+                url,
+            )[-MAX_READ_SOURCE_URLS:]
 
     def invalidate_review_evidence(self, path: str) -> None:
         """Invalidate exact-path eligibility and findings after a managed edit."""

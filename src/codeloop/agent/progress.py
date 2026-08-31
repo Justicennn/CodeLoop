@@ -41,6 +41,7 @@ _REVISION_SCOPED_TOOLS = {
     "list_files",
     "read_file",
     "read_document",
+    "read_webpage",
     "search_code",
     "run_command",
 }
@@ -251,6 +252,18 @@ def observation_digest(action: ProgressAction) -> str:
             data,
             "path",
             "document_type",
+            "text",
+            "position",
+            "truncated",
+            "next_cursor",
+        )
+    elif action.name == "read_webpage":
+        projection["data"] = _select(
+            data,
+            "requested_url",
+            "final_url",
+            "title",
+            "content_type",
             "text",
             "position",
             "truncated",

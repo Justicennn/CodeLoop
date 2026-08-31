@@ -88,7 +88,7 @@ def test_make_directory_nested_existing_and_registered_schema(
     assert root_noop["data"]["path"] == "."
     assert root_noop["data"]["workspace_changed"] is False
     assert workspace.root == original_root
-    assert len(registry.schemas) == 9
+    assert len(registry.schemas) == 10
     assert "repository_overview" in registry.names
     assert "make_directory" in registry.names
 
@@ -299,6 +299,7 @@ def test_registry_trusts_only_managed_mutation_effects(tmp_path: Path) -> None:
         "list_files",
         "read_file",
         "read_document",
+        "read_webpage",
         "search_code",
         "run_command",
     ):

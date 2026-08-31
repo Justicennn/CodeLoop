@@ -28,6 +28,7 @@ from codeloop.agent.requirements import (
 from codeloop.agent.runner import AgentRunner
 from codeloop.agent.task_state import TaskState
 from codeloop.execution.tools import ToolRegistry
+from codeloop.execution.web_sources import ExtractedWebPage
 from codeloop.execution.workspace import Workspace
 from codeloop.interaction.session import SessionHistory
 from codeloop.model.client import ModelAPIError, ModelResponse, ToolCall
@@ -87,6 +88,23 @@ def _requirement(
         "id": requirement_id,
         "kind": kind,
         "description": description,
+        "source": source,
+    }
+
+
+def _web_requirement(
+    requirement_id: str = "W1",
+    *,
+    url: str = "https://competition.example/spec",
+    locator: str | None = "Acceptance Criteria",
+) -> dict[str, Any]:
+    source: dict[str, str] = {"url": url}
+    if locator is not None:
+        source["locator"] = locator
+    return {
+        "id": requirement_id,
+        "kind": "acceptance",
+        "description": "The implementation must pass the published checks",
         "source": source,
     }
 
@@ -229,6 +247,125 @@ def test_requirement_sources_require_successful_eligible_reads() -> None:
     assert isolated["error_code"] == "unobserved_requirement_source"
 
 
+def test_web_requirement_sources_are_eligible_without_redirect_rewriting() -> None:
+    requested = "https://competition.example/spec"
+    final = "https://static.example/spec-v2"
+    state = TaskState()
+    unread = apply_requirements_action(
+        state,
+        _arguments([_web_requirement(url=requested)]),
+    )
+    assert unread["ok"] is False
+    assert unread["error_code"] == "unobserved_requirement_source"
+
+    state.record_execution_evidence(
+        tool_name="read_webpage",
+        result={
+            "ok": True,
+            "data": {
+                "requested_url": requested,
+                "final_url": final,
+                "title": "Competition",
+                "content_type": "text/html",
+                "text": "private webpage body",
+                "position": {
+                    "start_cursor": 0,
+                    "end_cursor": 20,
+                    "total_chars": 20,
+                },
+                "truncated": False,
+                "next_cursor": None,
+            },
+        },
+    )
+    assert state.read_source_urls == (requested, final)
+
+    requested_result = apply_requirements_action(
+        state,
+        _arguments([_web_requirement(url=requested)]),
+    )
+    assert requested_result["ok"] is True
+    requested_source = state.requirements.requirements[0].source
+    assert requested_source.url == requested
+    assert requested_source.path is None
+    snapshot = state.snapshot_for_model()
+    assert snapshot is not None
+    assert snapshot["requirements"][0]["source"] == {
+        "url": requested,
+        "locator": "Acceptance Criteria",
+    }
+    assert "private webpage body" not in repr(snapshot)
+
+    state.record_execution_evidence(
+        tool_name="read_webpage",
+        result={
+            "ok": True,
+            "data": {"requested_url": requested, "final_url": final},
+        },
+    )
+    assert state.read_source_urls == (requested, final)
+    assert state.requirements.requirements[0].source.url == requested
+
+    final_result = apply_requirements_action(
+        state,
+        _arguments([_web_requirement(url=final)]),
+    )
+    assert final_result["ok"] is True
+    assert state.requirements.requirements[0].source.url == final
+
+
+def test_web_source_fifo_dedup_snapshot_and_task_isolation() -> None:
+    state = TaskState()
+    urls = [f"https://example.com/spec/{index}" for index in range(130)]
+    for url in urls:
+        state.record_execution_evidence(
+            tool_name="read_webpage",
+            result={
+                "ok": True,
+                "data": {"requested_url": url, "final_url": url},
+            },
+        )
+    assert len(state.read_source_urls) == 128
+    assert state.read_source_urls == tuple(urls[-128:])
+    state.record_execution_evidence(
+        tool_name="read_webpage",
+        result={
+            "ok": True,
+            "data": {
+                "requested_url": urls[-1],
+                "final_url": urls[-1],
+            },
+        },
+    )
+    assert state.read_source_urls == tuple(urls[-128:])
+    assert state.snapshot_for_model() is None
+
+    other_task = TaskState()
+    rejected = apply_requirements_action(
+        other_task,
+        _arguments([_web_requirement(url=urls[-1])]),
+    )
+    assert rejected["error_code"] == "unobserved_requirement_source"
+
+
+def test_requirement_source_requires_exactly_one_path_or_url() -> None:
+    state = TaskState(
+        read_source_paths=("requirements.pdf",),
+        read_source_urls=("https://example.com/spec",),
+    )
+    neither = _requirement()
+    neither["source"] = {"locator": "section"}
+    both = _requirement()
+    both["source"] = {
+        "path": "requirements.pdf",
+        "url": "https://example.com/spec",
+    }
+    for item in (neither, both):
+        result = apply_requirements_action(state, _arguments([item]))
+        assert result["ok"] is False
+        assert result["error_code"] == "invalid_arguments"
+
+
 def test_requirement_bookkeeping_does_not_count_as_material_progress() -> None:
     state = TaskState(read_source_paths=("requirements.pdf",))
     result = apply_requirements_action(state, _arguments([_requirement()]))
@@ -249,6 +386,52 @@ def test_requirement_bookkeeping_does_not_count_as_material_progress() -> None:
         ),
     )
     assert decision == "continue"
+    assert progress.no_progress_turns == 1
+
+
+def test_repeated_webpage_chunk_does_not_refresh_material_progress() -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "requested_url": "https://example.com/spec",
+            "final_url": "https://example.com/spec",
+            "title": "Spec",
+            "content_type": "text/plain",
+            "text": "same chunk",
+            "position": {
+                "start_cursor": 0,
+                "end_cursor": 10,
+                "total_chars": 10,
+            },
+            "truncated": False,
+            "next_cursor": None,
+        },
+    }
+    action = ProgressAction(
+        name="read_webpage",
+        arguments='{"url":"https://example.com/spec"}',
+        result=result,
+        workspace_revision=0,
+        plan_before=None,
+        plan_after=None,
+    )
+    tracker = ProgressTracker()
+    progress = ProgressState()
+    facts = ProgressFacts(0, "not_required")
+
+    assert tracker.evaluate_turn(
+        progress,
+        before=facts,
+        after=facts,
+        actions=(action,),
+    ) == "continue"
+    assert progress.no_progress_turns == 0
+    assert tracker.evaluate_turn(
+        progress,
+        before=facts,
+        after=facts,
+        actions=(action,),
+    ) == "continue"
     assert progress.no_progress_turns == 1
 
 
@@ -278,11 +461,13 @@ def test_core_action_schema_retry_and_session_isolation(
     ]
     assert UPDATE_REQUIREMENTS_ACTION_NAME not in registry.names
     assert "read_document" in registry.names
+    assert "read_webpage" in registry.names
 
     history = SessionHistory()
     history.add("Build from requirements.pdf", "Implemented R1 and verified it.")
     serialized = repr(history.snapshot())
     assert "authoritative document body" not in serialized
+    assert "private webpage body" not in serialized
     assert "Implemented R1" in serialized
 
 
@@ -402,6 +587,159 @@ def test_source_guided_fake_client_uses_existing_coding_loop(
     ]
 
 
+def test_web_source_fake_client_uses_same_coding_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = "https://competition.example/spec"
+    final = "https://static.example/spec-v2"
+    (tmp_path / "app.txt").write_text("old\n", encoding="utf-8")
+    state = TaskState()
+    monkeypatch.setattr(runner_module, "TaskState", lambda: state)
+
+    class Adapter:
+        def extract(self, _url: str) -> ExtractedWebPage:
+            return ExtractedWebPage(
+                requested_url=requested,
+                final_url=final,
+                title="Competition Requirements",
+                content_type="text/plain",
+                text="Replace old with web and run an automated check.",
+            )
+
+    plan_created = [
+        {"id": "implement", "description": "Implement W1", "status": "in_progress"},
+        {"id": "verify", "description": "Verify W1", "status": "pending"},
+    ]
+    plan_verifying = [
+        {"id": "implement", "description": "Implement W1", "status": "completed"},
+        {"id": "verify", "description": "Verify W1", "status": "in_progress"},
+    ]
+    plan_completed = [
+        {"id": "implement", "description": "Implement W1", "status": "completed"},
+        {"id": "verify", "description": "Verify W1", "status": "completed"},
+    ]
+    client = FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall("web", "read_webpage", json.dumps({"url": requested}))]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        "requirements",
+                        UPDATE_REQUIREMENTS_ACTION_NAME,
+                        _arguments([_web_requirement(url=requested)]),
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall("plan", UPDATE_PLAN_ACTION_NAME, _plan_arguments(plan_created))
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall("inspect", "read_file", '{"path":"app.txt"}')]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        "edit",
+                        "edit_file",
+                        '{"path":"app.txt","old_text":"old\\n","new_text":"web\\n"}',
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        "plan-progress",
+                        UPDATE_PLAN_ACTION_NAME,
+                        _plan_arguments(plan_verifying, mode="update"),
+                    ),
+                    ToolCall(
+                        "verify",
+                        "run_command",
+                        json.dumps({"command": [sys.executable, "-c", "print('1 passed')"]}),
+                    ),
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        "plan-complete",
+                        UPDATE_PLAN_ACTION_NAME,
+                        _plan_arguments(plan_completed, mode="update"),
+                    )
+                ]
+            ),
+            ModelResponse(text="Implemented W1 from the requested URL and verified it."),
+        ]
+    )
+    registry = ToolRegistry(Workspace(tmp_path), webpage_adapter=Adapter())  # type: ignore[arg-type]
+
+    result = AgentRunner(client, tools=registry).run(
+        f"Implement the requirements at {requested} and verify them"
+    )
+
+    assert result.status == "completed"
+    assert result.verification_status == "verified"
+    assert result.plan_status == "completed"
+    assert (tmp_path / "app.txt").read_text(encoding="utf-8") == "web\n"
+    assert state.requirements.requirements[0].source.url == requested
+    assert state.read_source_urls == (requested, final)
+
+
+def test_web_read_and_requirement_action_share_sequential_turn_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = "https://example.com/spec"
+    state = TaskState()
+    monkeypatch.setattr(runner_module, "TaskState", lambda: state)
+
+    class Adapter:
+        def extract(self, _url: str) -> ExtractedWebPage:
+            return ExtractedWebPage(
+                requested,
+                requested,
+                "Spec",
+                "text/plain",
+                "Requirement body",
+            )
+
+    client = FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall("web", "read_webpage", json.dumps({"url": requested})),
+                    ToolCall(
+                        "requirements",
+                        UPDATE_REQUIREMENTS_ACTION_NAME,
+                        _arguments([_web_requirement(url=requested)]),
+                    ),
+                ]
+            ),
+            ModelResponse(text="Requirements recorded."),
+        ]
+    )
+    result = AgentRunner(
+        client,
+        tools=ToolRegistry(
+            Workspace(tmp_path),
+            webpage_adapter=Adapter(),  # type: ignore[arg-type]
+        ),
+    ).run(f"Read {requested}")
+
+    assert result.status == "completed"
+    assert state.requirements.requirements[0].source.url == requested
+    observations = client.calls[1]["messages"][-2:]
+    assert [message["tool_call_id"] for message in observations] == [
+        "web",
+        "requirements",
+    ]
+
+
 def test_prompt_fixes_source_and_verification_policy() -> None:
     prompt = SYSTEM_PROMPT
     assert "Read it sequentially through next_cursor" in prompt
@@ -411,3 +749,6 @@ def test_prompt_fixes_source_and_verification_policy() -> None:
     assert "Keep source requirements separate from Agent design decisions" in prompt
     assert "Use the existing TaskPlan and coding loop" in prompt
     assert "implemented but not automatically verified" in prompt
+    assert "use read_webpage" in prompt
+    assert "do not discover links, crawl a site, or guess content" in prompt
+    assert "normally cite the requested_url" in prompt
