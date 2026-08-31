@@ -17,7 +17,7 @@ import codeloop.agent.runner as agent_module
 import codeloop.execution.tools as tools_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.events import ToolEvent
-from codeloop.agent.prompt import SYSTEM_PROMPT
+from codeloop.prompts import SYSTEM_PROMPT
 from codeloop.agent.runner import (
     DEFAULT_MAX_STEPS,
     AgentResult,
@@ -1290,6 +1290,7 @@ def test_runner_exposes_the_current_action_schema_order(
         "read_file",
         "read_document",
         "read_webpage",
+        "read_image",
         "search_code",
         "edit_file",
         "write_file",

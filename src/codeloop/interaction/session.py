@@ -254,6 +254,9 @@ class InteractiveSession:
         registry = ToolRegistry(
             self._workspace,
             sensitive_values=self._sensitive_values,
+            supports_image_input=bool(
+                getattr(self._client, "supports_image_input", False)
+            ),
         )
         try:
             renderer = self._renderer_factory()

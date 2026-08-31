@@ -166,6 +166,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     base_url = os.environ.get("MODEL_BASE_URL", "")
     model = os.environ.get("MODEL_NAME", "")
 
+    try:
+        supports_image_input = _image_input_capability(
+            os.environ.get("MODEL_SUPPORTS_IMAGE_INPUT")
+        )
+    except ValueError:
+        print(
+            "Error: MODEL_SUPPORTS_IMAGE_INPUT must be true, false, or empty.",
+            file=sys.stderr,
+        )
+        return 2
+
     if not api_key or not base_url or not model:
         print(
             "Error: MODEL_API_KEY, MODEL_BASE_URL, and MODEL_NAME must be set.",
@@ -179,6 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_key=api_key,
             base_url=base_url,
             model=model,
+            supports_image_input=supports_image_input,
         )
         if args.task is None:
             return InteractiveSession(
@@ -191,7 +203,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_context_messages=args.max_context_messages,
             ).run()
 
-        registry = ToolRegistry(workspace, sensitive_values=(api_key,))
+        registry = ToolRegistry(
+            workspace,
+            sensitive_values=(api_key,),
+            supports_image_input=supports_image_input,
+        )
         try:
             renderer: ConsoleRenderer | None = ConsoleRenderer()
         except Exception:
@@ -239,6 +255,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if renderer is None or not _render_best_effort(renderer.show_result, result):
         _show_fallback_result(result)
     return EXIT_CODES[result.status]
+
+
+def _image_input_capability(value: str | None) -> bool:
+    if value is None or value == "" or value.casefold() == "false":
+        return False
+    if value.casefold() == "true":
+        return True
+    raise ValueError("invalid image input capability")
 
 
 def _stdin_is_interactive() -> bool:

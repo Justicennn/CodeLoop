@@ -19,6 +19,12 @@ from typing import Any
 from .command_policy import CommandApprovalRequest, dependency_mutation_request
 from .document_sources import DocumentSourceError, extract_document
 from .source_text import SourceTextSliceError, bounded_text_slice
+from .visual_sources import (
+    MAX_IMAGE_PATH_CHARS,
+    VisualAttachment,
+    VisualSourceAdapter,
+    VisualSourceError,
+)
 from .web_sources import MAX_WEB_URL_CHARS, WebPageAdapter, WebSourceError
 from .workspace import Workspace, WorkspaceError
 
@@ -31,6 +37,8 @@ MAX_READ_LINES = 200
 MAX_TEXT_CHARS = 20_000
 MAX_DOCUMENT_CHARS = 20_000
 MAX_WEBPAGE_CHARS = 20_000
+MAX_PENDING_VISUALS = 4
+MAX_PENDING_VISUAL_BYTES = 16 * 1024 * 1024
 MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 50
 MAX_OVERVIEW_PATH_CHARS = 1_000
@@ -80,6 +88,12 @@ class ToolDefinition:
     schema: dict[str, Any]
     handler: ToolHandler
     managed_workspace_mutation: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingVisualPayload:
+    descriptor: VisualAttachment
+    raw_bytes: bytes
 
 
 class ToolInputError(Exception):
@@ -429,6 +443,30 @@ READ_WEBPAGE_SCHEMA: dict[str, Any] = {
     },
 }
 
+READ_IMAGE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_image",
+        "description": (
+            "Validate and attach one local PNG, JPEG, or WEBP visual source for "
+            "the next model decision. Call read_image only with other read_image "
+            "calls in the same action turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_IMAGE_PATH_CHARS,
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 SEARCH_CODE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -527,7 +565,7 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    """A direct registry of ten narrow coding tools."""
+    """A direct registry of eleven narrow coding tools."""
 
     def __init__(
         self,
@@ -535,9 +573,18 @@ class ToolRegistry:
         *,
         sensitive_values: Iterable[str] = (),
         webpage_adapter: WebPageAdapter | None = None,
+        supports_image_input: bool = False,
+        visual_source_adapter: VisualSourceAdapter | None = None,
     ) -> None:
+        if not isinstance(supports_image_input, bool):
+            raise ValueError("supports_image_input must be a boolean")
         self._workspace = workspace
         self._webpage_adapter = webpage_adapter or WebPageAdapter()
+        self._supports_image_input = supports_image_input
+        self._visual_source_adapter = visual_source_adapter or VisualSourceAdapter(
+            workspace
+        )
+        self._pending_visuals: list[_PendingVisualPayload] = []
         self._sensitive_values = tuple(
             sorted(
                 {value for value in sensitive_values if value},
@@ -560,6 +607,7 @@ class ToolRegistry:
                 READ_WEBPAGE_SCHEMA,
                 self._read_webpage,
             ),
+            "read_image": ToolDefinition(READ_IMAGE_SCHEMA, self._read_image),
             "search_code": ToolDefinition(SEARCH_CODE_SCHEMA, self._search_code),
             "edit_file": ToolDefinition(
                 EDIT_FILE_SCHEMA,
@@ -587,6 +635,18 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         """Expose registered names for narrow cross-layer collision checks."""
         return tuple(self._tools)
+
+    def snapshot_pending_visuals(self) -> tuple[_PendingVisualPayload, ...]:
+        """Return an immutable run-local snapshot for one prepared request."""
+        return tuple(self._pending_visuals)
+
+    def consume_pending_visuals(self) -> None:
+        """Consume the current visual batch after a non-collection decision."""
+        self._pending_visuals.clear()
+
+    def discard_pending_visuals(self) -> None:
+        """Idempotently discard all raw visual payloads at task termination."""
+        self._pending_visuals.clear()
 
     def dispatch(self, name: str, arguments_json: str) -> ToolResult:
         definition = self._tools.get(name)
@@ -1167,6 +1227,51 @@ class ToolRegistry:
                 "next_cursor": source_slice.next_cursor,
             }
         )
+
+    def _read_image(self, arguments: dict[str, Any]) -> ToolResult:
+        _validate_fields(arguments, allowed={"path"}, required={"path"})
+        path_value = _string_argument(arguments, "path", allow_empty=False)
+        if len(path_value) > MAX_IMAGE_PATH_CHARS:
+            raise ToolInputError(
+                "invalid_arguments",
+                f"path cannot exceed {MAX_IMAGE_PATH_CHARS} characters.",
+            )
+        if not self._supports_image_input:
+            raise ToolInputError(
+                "vision_not_supported",
+                "Image input is disabled for the configured model provider.",
+            )
+        try:
+            descriptor, raw_bytes = self._visual_source_adapter.load(path_value)
+        except VisualSourceError as exc:
+            raise ToolInputError(exc.error_code, exc.message) from exc
+
+        replacement = _PendingVisualPayload(descriptor, raw_bytes)
+        existing_index = next(
+            (
+                index
+                for index, payload in enumerate(self._pending_visuals)
+                if payload.descriptor.source_label == descriptor.source_label
+            ),
+            None,
+        )
+        candidate = list(self._pending_visuals)
+        if existing_index is None:
+            if len(candidate) >= MAX_PENDING_VISUALS:
+                raise ToolInputError(
+                    "visual_attachment_limit",
+                    f"A model request can include at most {MAX_PENDING_VISUALS} images.",
+                )
+            candidate.append(replacement)
+        else:
+            candidate[existing_index] = replacement
+        if sum(len(payload.raw_bytes) for payload in candidate) > MAX_PENDING_VISUAL_BYTES:
+            raise ToolInputError(
+                "visual_attachment_limit",
+                "Pending visual sources exceed the 16 MiB total limit.",
+            )
+        self._pending_visuals = candidate
+        return _success(descriptor.to_result_data())
 
     def _search_code(self, arguments: dict[str, Any]) -> ToolResult:
         _validate_fields(

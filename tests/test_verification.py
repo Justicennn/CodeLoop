@@ -11,7 +11,7 @@ import pytest
 import codeloop.agent.runner as runner_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.plan import UPDATE_PLAN_ACTION_NAME
-from codeloop.agent.prompt import SYSTEM_PROMPT
+from codeloop.prompts import SYSTEM_PROMPT
 from codeloop.agent.runner import AgentRunner
 from codeloop.agent.task_state import TaskState
 from codeloop.agent.verification import VerificationState

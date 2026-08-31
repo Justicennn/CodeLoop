@@ -23,6 +23,10 @@ class _NarratingModelClient:
         self._delegate = delegate
         self._on_narration = on_narration
 
+    @property
+    def supports_image_input(self) -> bool:
+        return bool(getattr(self._delegate, "supports_image_input", False))
+
     def complete(
         self,
         messages: list[dict[str, Any]],

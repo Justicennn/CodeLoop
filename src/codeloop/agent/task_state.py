@@ -32,6 +32,7 @@ MAX_INSPECTED_EVIDENCE_PATHS = 512
 MAX_READ_SOURCE_PATHS = 128
 MAX_READ_SOURCE_URLS = 128
 MAX_READ_SOURCE_URL_CHARS = 2_000
+MAX_READ_VISUAL_SOURCE_PATHS = 16
 _TEXT_SOURCE_EXTENSIONS = {".txt", ".md", ".json", ".yaml", ".yml"}
 
 
@@ -49,6 +50,7 @@ class TaskState:
     inspected_evidence_paths: tuple[str, ...] = ()
     read_source_paths: tuple[str, ...] = ()
     read_source_urls: tuple[str, ...] = ()
+    read_visual_source_paths: tuple[str, ...] = ()
     last_completion_review_fingerprint: CompletionReviewFingerprint | None = None
     pending_completion_review: dict[str, Any] | None = None
 
@@ -102,6 +104,21 @@ class TaskState:
                 "invalid_requirement_sources",
                 "Read source URLs must be unique.",
             )
+        if len(self.read_visual_source_paths) > MAX_READ_VISUAL_SOURCE_PATHS:
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read visual source paths exceed the task-local limit.",
+            )
+        normalized_visual_sources = tuple(
+            normalize_workspace_relative_path(path)
+            for path in self.read_visual_source_paths
+        )
+        if len(set(normalized_visual_sources)) != len(normalized_visual_sources):
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read visual source paths must be unique.",
+            )
+        self.read_visual_source_paths = normalized_visual_sources
 
     def replace_plan(self, plan: TaskPlan) -> None:
         self.plan = plan
@@ -152,6 +169,20 @@ class TaskState:
         if not isinstance(source_path, str):
             if tool_name == "read_webpage":
                 self._record_web_source_urls(data)
+            return
+        if tool_name == "read_image":
+            try:
+                normalized_visual_source = normalize_workspace_relative_path(
+                    source_path
+                )
+            except RepositoryStateValidationError:
+                return
+            if normalized_visual_source in self.read_visual_source_paths:
+                return
+            self.read_visual_source_paths = (
+                *self.read_visual_source_paths,
+                normalized_visual_source,
+            )[-MAX_READ_VISUAL_SOURCE_PATHS:]
             return
         if tool_name == "read_document":
             eligible_source = True

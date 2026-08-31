@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable, Sequence
 from copy import deepcopy
@@ -30,7 +31,7 @@ from .plan import (
     UPDATE_PLAN_SCHEMA,
     apply_plan_action,
 )
-from .prompt import SYSTEM_PROMPT
+from ..prompts import SYSTEM_PROMPT
 from .progress import ProgressAction, ProgressFacts, ProgressTracker
 from .repository import (
     UPDATE_WORKING_SET_ACTION_NAME,
@@ -70,6 +71,11 @@ _CORE_ACTION_NAMES = frozenset(
         UPDATE_WORKING_SET_ACTION_NAME,
         UPDATE_REVIEW_FINDINGS_ACTION_NAME,
     }
+)
+_INVALID_VISUAL_SEQUENCE_MESSAGE = (
+    "read_image must be completed in a visual-only action turn. Read the visual "
+    "sources first, then use the next multimodal decision to update requirements "
+    "or continue the task."
 )
 
 
@@ -197,6 +203,17 @@ class AgentRunner:
         *,
         previous_turns: Sequence[PublicConversationTurn] = (),
     ) -> AgentResult:
+        try:
+            return self._run(task, previous_turns=previous_turns)
+        finally:
+            self._tools.discard_pending_visuals()
+
+    def _run(
+        self,
+        task: str,
+        *,
+        previous_turns: Sequence[PublicConversationTurn] = (),
+    ) -> AgentResult:
         context = ConversationContext(
             SYSTEM_PROMPT,
             task,
@@ -218,12 +235,30 @@ class AgentRunner:
                     task_state.clear_pending_completion_review()
                     prepared_messages = context.messages_for_model()
                     prepared_action_schemas = deepcopy(self._action_schemas)
+                    pending_visuals = self._tools.snapshot_pending_visuals()
+                    if pending_visuals:
+                        prepared_messages.append(
+                            _visual_request_message(pending_visuals)
+                        )
+                    del pending_visuals
                     response = self._request_model(
                         prepared_messages,
                         prepared_action_schemas,
                     )
                 finally:
                     _notify_presentation(self._on_model_request_finished)
+
+                has_read_image = any(
+                    call.name == "read_image" for call in response.tool_calls
+                )
+                pure_visual_collection = bool(response.tool_calls) and all(
+                    call.name == "read_image" for call in response.tool_calls
+                )
+                invalid_visual_sequence = (
+                    has_read_image and not pure_visual_collection
+                )
+                if not has_read_image:
+                    self._tools.consume_pending_visuals()
 
                 if not response.tool_calls:
                     if (
@@ -245,11 +280,18 @@ class AgentRunner:
                 progress_before = _progress_facts(task_state)
                 progress_actions: list[ProgressAction] = []
                 tool_messages: list[dict[str, Any]] = []
+                repeated_failure_name: str | None = None
                 for tool_call in response.tool_calls:
                     dispatch_started = perf_counter()
                     plan_before = task_state.plan
                     approval_blocked = False
-                    if tool_call.name == UPDATE_PLAN_ACTION_NAME:
+                    if invalid_visual_sequence:
+                        result = {
+                            "ok": False,
+                            "error_code": "invalid_action_sequence",
+                            "message": _INVALID_VISUAL_SEQUENCE_MESSAGE,
+                        }
+                    elif tool_call.name == UPDATE_PLAN_ACTION_NAME:
                         result = apply_plan_action(task_state, tool_call.arguments)
                     elif tool_call.name == UPDATE_REQUIREMENTS_ACTION_NAME:
                         result = apply_requirements_action(
@@ -328,7 +370,8 @@ class AgentRunner:
                         }
                     )
                     if (
-                        tool_call.name not in _CORE_ACTION_NAMES
+                        not invalid_visual_sequence
+                        and tool_call.name not in _CORE_ACTION_NAMES
                         and self._on_tool_event is not None
                     ):
                         _notify_presentation(
@@ -340,18 +383,24 @@ class AgentRunner:
                                 truncated=_tool_result_is_truncated(result),
                             )
                         )
-                    if not approval_blocked and failures.record(tool_call, result):
-                        return self._result(
-                            task_state,
-                            status="repeated_failure",
-                            answer=None,
-                            steps=step,
-                            message=(
-                                "Three consecutive identical action failures "
-                                f"occurred for {tool_call.name}."
-                            ),
-                        )
+                    if (
+                        not approval_blocked
+                        and failures.record(tool_call, result)
+                        and repeated_failure_name is None
+                    ):
+                        repeated_failure_name = tool_call.name
                 context.add_tool_cycle(assistant_message, tool_messages)
+                if repeated_failure_name is not None:
+                    return self._result(
+                        task_state,
+                        status="repeated_failure",
+                        answer=None,
+                        steps=step,
+                        message=(
+                            "Three consecutive identical action failures "
+                            f"occurred for {repeated_failure_name}."
+                        ),
+                    )
                 progress_decision = progress_tracker.evaluate_turn(
                     task_state.progress,
                     before=progress_before,
@@ -534,6 +583,28 @@ def _tool_result_is_truncated(result: ToolResult) -> bool:
         data.get(field) is True
         for field in ("truncated", "stdout_truncated", "stderr_truncated")
     )
+
+
+def _visual_request_message(pending_visuals: Sequence[Any]) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    for payload in pending_visuals:
+        descriptor = payload.descriptor
+        encoded = base64.b64encode(payload.raw_bytes).decode("ascii")
+        content.extend(
+            (
+                {
+                    "type": "text",
+                    "text": f"Visual source: {descriptor.source_label}",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{descriptor.mime_type};base64,{encoded}"
+                    },
+                },
+            )
+        )
+    return {"role": "user", "content": content}
 
 
 def _progress_facts(task_state: TaskState) -> ProgressFacts:

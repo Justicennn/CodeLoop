@@ -42,6 +42,7 @@ _REVISION_SCOPED_TOOLS = {
     "read_file",
     "read_document",
     "read_webpage",
+    "read_image",
     "search_code",
     "run_command",
 }
@@ -268,6 +269,14 @@ def observation_digest(action: ProgressAction) -> str:
             "position",
             "truncated",
             "next_cursor",
+        )
+    elif action.name == "read_image":
+        projection["data"] = _select(
+            data,
+            "path",
+            "image_type",
+            "mime_type",
+            "size_bytes",
         )
     elif action.name == "search_code":
         projection["data"] = _select(

@@ -774,6 +774,40 @@ def test_cli_task_is_optional_and_dispatches_interactive_mode(
     assert observed["workspace"].root == tmp_path.resolve()
 
 
+def test_cli_image_capability_is_strict_and_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("MODEL_API_KEY", "key")
+    monkeypatch.setenv("MODEL_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("MODEL_NAME", "fake")
+    monkeypatch.setenv("MODEL_SUPPORTS_IMAGE_INPUT", "maybe")
+    assert cli_module.main(["task", "--workspace", str(tmp_path)]) == 2
+    assert "MODEL_SUPPORTS_IMAGE_INPUT" in capsys.readouterr().err
+
+    monkeypatch.setenv("MODEL_SUPPORTS_IMAGE_INPUT", "TRUE")
+    client = FakeClient([ModelResponse(text="done")])
+    client_kwargs: dict[str, Any] = {}
+    registry_kwargs: dict[str, Any] = {}
+    real_registry = ToolRegistry
+
+    def client_factory(**kwargs: Any) -> FakeClient:
+        client_kwargs.update(kwargs)
+        return client
+
+    def registry_factory(workspace: Workspace, **kwargs: Any) -> ToolRegistry:
+        registry_kwargs.update(kwargs)
+        return real_registry(workspace, **kwargs)
+
+    monkeypatch.setattr(cli_module, "OpenAICompatibleClient", client_factory)
+    monkeypatch.setattr(cli_module, "ToolRegistry", registry_factory)
+    monkeypatch.setattr(cli_module, "ConsoleRenderer", lambda: None)
+    assert cli_module.main(["task", "--workspace", str(tmp_path)]) == 0
+    assert client_kwargs["supports_image_input"] is True
+    assert registry_kwargs["supports_image_input"] is True
+
+
 def test_cli_one_shot_branch_keeps_original_message_shape(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

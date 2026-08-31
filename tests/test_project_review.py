@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 import codeloop.agent.runner as runner_module
-from codeloop.agent.prompt import SYSTEM_PROMPT
+from codeloop.prompts import SYSTEM_PROMPT
 from codeloop.agent.progress import ProgressAction, ProgressFacts, ProgressTracker
 from codeloop.agent.repository import (
     MAX_WORKING_SET_ENTRIES,

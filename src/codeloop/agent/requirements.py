@@ -31,7 +31,7 @@ UPDATE_REQUIREMENTS_SCHEMA: dict[str, Any] = {
         "name": UPDATE_REQUIREMENTS_ACTION_NAME,
         "description": (
             "Replace the current task's bounded requirements extracted from "
-            "successfully read local documents or explicit webpages."
+            "successfully read local documents, visual sources, or explicit webpages."
         ),
         "parameters": {
             "type": "object",
@@ -214,7 +214,9 @@ def apply_requirements_action(
     try:
         arguments = _parse_arguments(arguments_json)
         requirements = _parse_requirements(arguments["requirements"])
-        eligible_paths = set(task_state.read_source_paths)
+        eligible_paths = set(task_state.read_source_paths).union(
+            task_state.read_visual_source_paths
+        )
         eligible_urls = set(task_state.read_source_urls)
         unobserved = sorted(
             source

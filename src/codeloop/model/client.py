@@ -52,6 +52,11 @@ class ModelResponse:
 class ModelClient(Protocol):
     """Structural contract shared by the real client and test fake."""
 
+    @property
+    def supports_image_input(self) -> bool:
+        """Whether the caller explicitly enabled native image input."""
+        ...
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -63,15 +68,29 @@ class ModelClient(Protocol):
 class OpenAICompatibleClient:
     """Send chat/tool-calling requests through one ordinary API client."""
 
-    def __init__(self, *, api_key: str, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        supports_image_input: bool = False,
+    ) -> None:
         if not api_key or not base_url or not model:
             raise ValueError("MODEL_API_KEY, MODEL_BASE_URL, and MODEL_NAME are required")
+        if not isinstance(supports_image_input, bool):
+            raise ValueError("supports_image_input must be a boolean")
         self._client = OpenAI(
             api_key=api_key,
             base_url=base_url,
             max_retries=0,
         )
         self._model = model
+        self._supports_image_input = supports_image_input
+
+    @property
+    def supports_image_input(self) -> bool:
+        return self._supports_image_input
 
     def complete(
         self,

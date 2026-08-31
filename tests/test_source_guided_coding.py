@@ -19,7 +19,7 @@ from codeloop.agent.progress import (
     ProgressState,
     ProgressTracker,
 )
-from codeloop.agent.prompt import SYSTEM_PROMPT
+from codeloop.prompts import SYSTEM_PROMPT
 from codeloop.agent.requirements import (
     MAX_REQUIREMENTS,
     UPDATE_REQUIREMENTS_ACTION_NAME,
@@ -247,6 +247,65 @@ def test_requirement_sources_require_successful_eligible_reads() -> None:
     assert isolated["error_code"] == "unobserved_requirement_source"
 
 
+def test_visual_requirement_sources_use_separate_successful_read_eligibility() -> None:
+    state = TaskState()
+    unread = apply_requirements_action(
+        state,
+        _arguments([_requirement(path="1.png", locator="visible requirements text")]),
+    )
+    assert unread["error_code"] == "unobserved_requirement_source"
+
+    state.record_execution_evidence(
+        tool_name="read_image",
+        result={
+            "ok": True,
+            "data": {
+                "path": "1.png",
+                "image_type": "png",
+                "mime_type": "image/png",
+                "size_bytes": 12,
+            },
+        },
+    )
+    accepted = apply_requirements_action(
+        state,
+        _arguments(
+            [
+                _requirement(
+                    "V1",
+                    path="1.png",
+                    kind="functional",
+                    locator="visible requirements text",
+                ),
+                _requirement(
+                    "V2",
+                    path="1.png",
+                    kind="reference",
+                    description="Use the visible sidebar and card layout",
+                    locator="overall visible layout",
+                ),
+            ]
+        ),
+    )
+    assert accepted["ok"] is True
+    assert {item.kind for item in state.requirements.requirements} == {
+        "functional",
+        "reference",
+    }
+    snapshot = state.snapshot_for_model()
+    assert snapshot is not None
+    assert "read_visual_source_paths" not in snapshot
+    assert "image/png" not in repr(snapshot)
+    assert "base64" not in repr(snapshot)
+
+    other_task = TaskState()
+    rejected = apply_requirements_action(
+        other_task,
+        _arguments([_requirement(path="1.png")]),
+    )
+    assert rejected["error_code"] == "unobserved_requirement_source"
+
+
 def test_web_requirement_sources_are_eligible_without_redirect_rewriting() -> None:
     requested = "https://competition.example/spec"
     final = "https://static.example/spec-v2"
@@ -462,6 +521,7 @@ def test_core_action_schema_retry_and_session_isolation(
     assert UPDATE_REQUIREMENTS_ACTION_NAME not in registry.names
     assert "read_document" in registry.names
     assert "read_webpage" in registry.names
+    assert "read_image" in registry.names
 
     history = SessionHistory()
     history.add("Build from requirements.pdf", "Implemented R1 and verified it.")
@@ -752,3 +812,8 @@ def test_prompt_fixes_source_and_verification_policy() -> None:
     assert "use read_webpage" in prompt
     assert "do not discover links, crawl a site, or guess content" in prompt
     assert "normally cite the requested_url" in prompt
+    assert "use read_image" in prompt
+    assert "A filename is only a source label" in prompt
+    assert "One image may support multiple functional" in prompt
+    assert "Every model decision that calls read_image must contain only read_image calls" in prompt
+    assert "Never mix read_image with another Tool or Core Action" in prompt
