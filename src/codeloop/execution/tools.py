@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .command_policy import CommandApprovalRequest, dependency_mutation_request
+from .document_sources import DocumentSourceError, extract_document
 from .workspace import Workspace, WorkspaceError
 
 ToolResult = dict[str, Any]
@@ -26,6 +27,7 @@ MAX_LIST_ITEMS = 200
 MAX_LIST_DEPTH = 8
 MAX_READ_LINES = 200
 MAX_TEXT_CHARS = 20_000
+MAX_DOCUMENT_CHARS = 20_000
 MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 50
 MAX_OVERVIEW_PATH_CHARS = 1_000
@@ -367,6 +369,32 @@ READ_FILE_SCHEMA: dict[str, Any] = {
     },
 }
 
+READ_DOCUMENT_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_document",
+        "description": (
+            "Read a bounded deterministic text range from a local PDF or DOCX "
+            "document. Continue with next_cursor when truncated."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "cursor": {"type": "integer", "minimum": 0, "default": 0},
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_DOCUMENT_CHARS,
+                    "default": MAX_DOCUMENT_CHARS,
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 SEARCH_CODE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -465,7 +493,7 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
 
 
 class ToolRegistry:
-    """A direct registry of eight workspace-bound coding tools."""
+    """A direct registry of nine workspace-bound coding tools."""
 
     def __init__(
         self,
@@ -488,6 +516,10 @@ class ToolRegistry:
             ),
             "list_files": ToolDefinition(LIST_FILES_SCHEMA, self._list_files),
             "read_file": ToolDefinition(READ_FILE_SCHEMA, self._read_file),
+            "read_document": ToolDefinition(
+                READ_DOCUMENT_SCHEMA,
+                self._read_document,
+            ),
             "search_code": ToolDefinition(SEARCH_CODE_SCHEMA, self._search_code),
             "edit_file": ToolDefinition(
                 EDIT_FILE_SCHEMA,
@@ -970,6 +1002,63 @@ class ToolRegistry:
                 "total_lines": total_lines,
                 "content": numbered,
                 "truncated": chars_truncated or lines_truncated,
+            }
+        )
+
+    def _read_document(self, arguments: dict[str, Any]) -> ToolResult:
+        _validate_fields(
+            arguments,
+            allowed={"path", "cursor", "max_chars"},
+            required={"path"},
+        )
+        path_value = _string_argument(arguments, "path", allow_empty=False)
+        cursor = _integer_argument(
+            arguments,
+            "cursor",
+            default=0,
+            minimum=0,
+            maximum=2_147_483_647,
+        )
+        max_chars = _integer_argument(
+            arguments,
+            "max_chars",
+            default=MAX_DOCUMENT_CHARS,
+            minimum=1,
+            maximum=MAX_DOCUMENT_CHARS,
+        )
+        path = self._workspace.resolve(path_value, expected="file")
+        try:
+            document = extract_document(path)
+        except DocumentSourceError as exc:
+            raise ToolInputError(exc.error_code, exc.message) from exc
+
+        total_chars = len(document.text)
+        if cursor > total_chars:
+            raise ToolInputError(
+                "invalid_arguments",
+                "cursor cannot exceed the document's total_chars.",
+                data={"cursor": cursor, "total_chars": total_chars},
+            )
+        end_cursor = min(total_chars, cursor + max_chars)
+        truncated = end_cursor < total_chars
+        first_unit = document.locator_at(cursor) if cursor < end_cursor else None
+        last_unit = (
+            document.locator_at(end_cursor - 1) if cursor < end_cursor else None
+        )
+        return _success(
+            {
+                "path": self._workspace.relative_path(path),
+                "document_type": document.document_type,
+                "text": document.text[cursor:end_cursor],
+                "position": {
+                    "start_cursor": cursor,
+                    "end_cursor": end_cursor,
+                    "total_chars": total_chars,
+                    "first_unit": first_unit,
+                    "last_unit": last_unit,
+                },
+                "truncated": truncated,
+                "next_cursor": end_cursor if truncated else None,
             }
         )
 

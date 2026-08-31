@@ -395,8 +395,9 @@ def test_core_actions_are_not_execution_tools_and_runner_routes_them(
         "finding",
     ]
     names = [schema["function"]["name"] for schema in client.calls[0]["tools"]]
-    assert names[:3] == [
+    assert names[:4] == [
         "update_plan",
+        "update_requirements",
         UPDATE_WORKING_SET_ACTION_NAME,
         UPDATE_REVIEW_FINDINGS_ACTION_NAME,
     ]

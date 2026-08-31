@@ -1267,7 +1267,7 @@ def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
     )
 
 
-def test_runner_exposes_the_existing_action_schema_order_unchanged(
+def test_runner_exposes_the_current_action_schema_order(
     tmp_path: Path,
 ) -> None:
     client = FakeClient([ModelResponse(text="done")])
@@ -1282,11 +1282,13 @@ def test_runner_exposes_the_existing_action_schema_order_unchanged(
         schema["function"]["name"] for schema in client.calls[0]["tools"]
     ] == [
         "update_plan",
+        "update_requirements",
         "update_working_set",
         "update_review_findings",
         "repository_overview",
         "list_files",
         "read_file",
+        "read_document",
         "search_code",
         "edit_file",
         "write_file",

@@ -25,7 +25,13 @@ FAILURE_EVIDENCE_CHARS = FAILURE_OUTPUT_LIMIT
 SUCCESS_EVIDENCE_CHARS = SUCCESS_OUTPUT_LIMIT
 OUTPUT_TRUNCATION_MARKER = TRUNCATION_MARKER
 _READ_ONLY_TOOLS = frozenset(
-    {"repository_overview", "list_files", "read_file", "search_code"}
+    {
+        "repository_overview",
+        "list_files",
+        "read_file",
+        "read_document",
+        "search_code",
+    }
 )
 
 

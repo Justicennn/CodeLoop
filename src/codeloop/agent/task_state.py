@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from .plan import PlanStep, TaskPlan
@@ -13,6 +14,7 @@ from .repository import (
     normalize_workspace_relative_path,
 )
 from .review import ReviewState
+from .requirements import RequirementState
 from .verification import VerificationState, VerificationStatus
 
 PlanOutcome = Literal[
@@ -27,6 +29,8 @@ _COMPLETION_REVIEW_INSTRUCTION = (
     "verification command, or explain why completion remains limited."
 )
 MAX_INSPECTED_EVIDENCE_PATHS = 512
+MAX_READ_SOURCE_PATHS = 128
+_TEXT_SOURCE_EXTENSIONS = {".txt", ".md", ".json", ".yaml", ".yml"}
 
 
 @dataclass
@@ -39,7 +43,9 @@ class TaskState:
     progress: ProgressState = field(default_factory=ProgressState)
     working_set: RepositoryWorkingSet = field(default_factory=RepositoryWorkingSet)
     review_state: ReviewState = field(default_factory=ReviewState)
+    requirements: RequirementState = field(default_factory=RequirementState)
     inspected_evidence_paths: tuple[str, ...] = ()
+    read_source_paths: tuple[str, ...] = ()
     last_completion_review_fingerprint: CompletionReviewFingerprint | None = None
     pending_completion_review: dict[str, Any] | None = None
 
@@ -59,6 +65,20 @@ class TaskState:
                 "Inspected evidence paths must be unique.",
             )
         self.inspected_evidence_paths = normalized
+        if len(self.read_source_paths) > MAX_READ_SOURCE_PATHS:
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read source paths exceed the task-local limit.",
+            )
+        normalized_sources = tuple(
+            normalize_workspace_relative_path(path) for path in self.read_source_paths
+        )
+        if len(set(normalized_sources)) != len(normalized_sources):
+            raise RepositoryStateValidationError(
+                "invalid_requirement_sources",
+                "Read source paths must be unique.",
+            )
+        self.read_source_paths = normalized_sources
 
     def replace_plan(self, plan: TaskPlan) -> None:
         self.plan = plan
@@ -104,6 +124,31 @@ class TaskState:
                 *self.inspected_evidence_paths,
                 normalized,
             )[-MAX_INSPECTED_EVIDENCE_PATHS:]
+
+        source_path = data.get("path")
+        if not isinstance(source_path, str):
+            return
+        if tool_name == "read_document":
+            eligible_source = True
+        elif tool_name == "read_file":
+            eligible_source = (
+                PurePosixPath(source_path).suffix.casefold()
+                in _TEXT_SOURCE_EXTENSIONS
+            )
+        else:
+            eligible_source = False
+        if not eligible_source:
+            return
+        try:
+            normalized_source = normalize_workspace_relative_path(source_path)
+        except RepositoryStateValidationError:
+            return
+        if normalized_source in self.read_source_paths:
+            return
+        self.read_source_paths = (
+            *self.read_source_paths,
+            normalized_source,
+        )[-MAX_READ_SOURCE_PATHS:]
 
     def invalidate_review_evidence(self, path: str) -> None:
         """Invalidate exact-path eligibility and findings after a managed edit."""
@@ -198,6 +243,9 @@ class TaskState:
         review_findings = self.review_state.to_snapshot()
         if review_findings is not None:
             snapshot["review_findings"] = review_findings
+        requirements = self.requirements.to_snapshot()
+        if requirements is not None:
+            snapshot["requirements"] = requirements
         return snapshot or None
 
     def _completion_review_reasons(self) -> tuple[str, ...]:

@@ -42,6 +42,11 @@ from .review import (
     UPDATE_REVIEW_FINDINGS_SCHEMA,
     apply_review_findings_action,
 )
+from .requirements import (
+    UPDATE_REQUIREMENTS_ACTION_NAME,
+    UPDATE_REQUIREMENTS_SCHEMA,
+    apply_requirements_action,
+)
 from .task_state import PlanOutcome, TaskState
 from .verification import VerificationAttempt, VerificationStatus
 
@@ -61,6 +66,7 @@ MAX_CONFIGURED_STEPS = 100
 _CORE_ACTION_NAMES = frozenset(
     {
         UPDATE_PLAN_ACTION_NAME,
+        UPDATE_REQUIREMENTS_ACTION_NAME,
         UPDATE_WORKING_SET_ACTION_NAME,
         UPDATE_REVIEW_FINDINGS_ACTION_NAME,
     }
@@ -179,6 +185,7 @@ class AgentRunner:
             )
         self._action_schemas = [
             UPDATE_PLAN_SCHEMA,
+            UPDATE_REQUIREMENTS_SCHEMA,
             UPDATE_WORKING_SET_SCHEMA,
             UPDATE_REVIEW_FINDINGS_SCHEMA,
             *execution_schemas,
@@ -244,6 +251,11 @@ class AgentRunner:
                     approval_blocked = False
                     if tool_call.name == UPDATE_PLAN_ACTION_NAME:
                         result = apply_plan_action(task_state, tool_call.arguments)
+                    elif tool_call.name == UPDATE_REQUIREMENTS_ACTION_NAME:
+                        result = apply_requirements_action(
+                            task_state,
+                            tool_call.arguments,
+                        )
                     elif tool_call.name == UPDATE_WORKING_SET_ACTION_NAME:
                         result = apply_working_set_action(
                             task_state,

@@ -88,7 +88,7 @@ def test_make_directory_nested_existing_and_registered_schema(
     assert root_noop["data"]["path"] == "."
     assert root_noop["data"]["workspace_changed"] is False
     assert workspace.root == original_root
-    assert len(registry.schemas) == 8
+    assert len(registry.schemas) == 9
     assert "repository_overview" in registry.names
     assert "make_directory" in registry.names
 
@@ -295,7 +295,13 @@ def test_registry_trusts_only_managed_mutation_effects(tmp_path: Path) -> None:
 
     assert result["data"]["workspace_changed"] is True
     assert registry.confirmed_workspace_change("read_file", result) is False
-    for tool_name in ("list_files", "read_file", "search_code", "run_command"):
+    for tool_name in (
+        "list_files",
+        "read_file",
+        "read_document",
+        "search_code",
+        "run_command",
+    ):
         assert registry.confirmed_workspace_change(tool_name, forged) is False
     assert registry.confirmed_workspace_change("unknown", forged) is False
 

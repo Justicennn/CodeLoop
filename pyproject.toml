@@ -9,6 +9,8 @@ description = "A small, self-built local coding-agent runtime."
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0,<3",
+    "pypdf>=6,<7",
+    "python-docx>=1.2,<2",
     "rich>=14,<16",
 ]
 

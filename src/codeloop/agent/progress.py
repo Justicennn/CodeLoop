@@ -15,6 +15,7 @@ from typing import Any, Literal, Mapping
 from .plan import TaskPlan, UPDATE_PLAN_ACTION_NAME
 from .repository import UPDATE_WORKING_SET_ACTION_NAME
 from .review import UPDATE_REVIEW_FINDINGS_ACTION_NAME
+from .requirements import UPDATE_REQUIREMENTS_ACTION_NAME
 from .verification import VerificationStatus
 
 ProgressStatus = Literal["active", "possible_stall"]
@@ -39,12 +40,14 @@ _REVISION_SCOPED_TOOLS = {
     "repository_overview",
     "list_files",
     "read_file",
+    "read_document",
     "search_code",
     "run_command",
 }
 _MUTATION_TOOLS = {"edit_file", "write_file", "make_directory"}
 _CORE_STATE_ACTIONS = {
     UPDATE_PLAN_ACTION_NAME,
+    UPDATE_REQUIREMENTS_ACTION_NAME,
     UPDATE_WORKING_SET_ACTION_NAME,
     UPDATE_REVIEW_FINDINGS_ACTION_NAME,
 }
@@ -243,6 +246,16 @@ def observation_digest(action: ProgressAction) -> str:
             "content",
             "truncated",
         )
+    elif action.name == "read_document":
+        projection["data"] = _select(
+            data,
+            "path",
+            "document_type",
+            "text",
+            "position",
+            "truncated",
+            "next_cursor",
+        )
     elif action.name == "search_code":
         projection["data"] = _select(
             data,
@@ -281,6 +294,7 @@ def observation_digest(action: ProgressAction) -> str:
         else:
             projection["data"] = _select(data, "changed_step_ids")
     elif action.name in {
+        UPDATE_REQUIREMENTS_ACTION_NAME,
         UPDATE_WORKING_SET_ACTION_NAME,
         UPDATE_REVIEW_FINDINGS_ACTION_NAME,
     }:
