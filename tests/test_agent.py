@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from copy import deepcopy
+from importlib.resources import files
 from inspect import signature
 from io import StringIO
 from pathlib import Path
@@ -1206,6 +1207,17 @@ def test_public_narration_and_detailed_final_are_rendered_without_inference() ->
 
 def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
     prompt = SYSTEM_PROMPT
+    resource_prompt = files("codeloop.prompts").joinpath("system.md").read_text(
+        encoding="utf-8"
+    )
+    assert prompt == resource_prompt
+    assert prompt
+    assert "# CodeLoop System Prompt" in prompt
+    assert "## Workspace and Evidence" in prompt
+    assert "## Requirement Sources" in prompt
+    assert "## Visual Sources" in prompt
+    assert "## Verification" in prompt
+    assert "## Final Answer" in prompt
     assert (
         "Public narration is optional, not a required response format" in prompt
     )
