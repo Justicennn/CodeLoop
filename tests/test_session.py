@@ -241,8 +241,11 @@ def test_interactive_tasks_receive_only_bounded_public_results(
         {"role": "user", "content": "second task"},
     ]
     assert all(message.get("role") != "tool" for message in second)
-    assert "CodeLoop · fake" in output
-    assert str(tmp_path.resolve()) in output
+    assert "CodeLoop" in output
+    assert "Welcome to CodeLoop" in output
+    assert "model: fake" in output
+    assert f"workspace: {tmp_path.resolve()}" in output
+    assert "mode: interactive" in output
     assert not any(line.startswith("Workspace:") for line in output)
     assert "Type /help for commands." not in output
     assert "✓ Task completed · 1 steps\n\nfirst answer" in output
@@ -250,9 +253,14 @@ def test_interactive_tasks_receive_only_bounded_public_results(
     assert all("Verified" not in line for line in output)
 
 
-def test_interactive_prompt_is_compact(tmp_path: Path) -> None:
+@pytest.mark.parametrize("exit_input", ["/exit", "exit", "quit", "EXIT", "Quit"])
+def test_interactive_prompt_is_compact(
+    tmp_path: Path,
+    exit_input: str,
+) -> None:
     prompts: list[str] = []
-    values = iter(["/exit"])
+    output: list[str] = []
+    values = iter([exit_input])
 
     def read_line(prompt: str) -> str:
         prompts.append(prompt)
@@ -263,12 +271,14 @@ def test_interactive_prompt_is_compact(tmp_path: Path) -> None:
         model_name="fake",
         workspace=Workspace(tmp_path),
         read_line=read_line,
-        write_line=lambda _line: None,
+        write_line=output.append,
         renderer_factory=lambda: None,
     )
 
     assert session.run() == 0
-    assert prompts == ["codeloop > "]
+    assert prompts == ["> "]
+    if not exit_input.startswith("/"):
+        assert "Bye." in output
 
 
 def test_redundant_codeloop_invocation_is_not_a_task_or_history_turn(
@@ -570,6 +580,17 @@ def test_eof_and_prompt_interrupt_have_fixed_exit_codes(tmp_path: Path) -> None:
             renderer_factory=lambda: None,
         )
         assert session.run() == expected
+
+    unexpected = InteractiveSession(
+        FakeClient([]),
+        model_name="fake",
+        workspace=Workspace(tmp_path),
+        read_line=_input([RuntimeError("custom input failed")]),
+        write_line=lambda _line: None,
+        renderer_factory=lambda: None,
+    )
+    with pytest.raises(RuntimeError, match="custom input failed"):
+        unexpected.run()
 
 
 def test_task_interrupt_returns_to_the_session_prompt(tmp_path: Path) -> None:

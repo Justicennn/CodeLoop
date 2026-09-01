@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import get_terminal_size
 from typing import Any
 
 from ..agent import PublicConversationTurn
@@ -139,6 +140,7 @@ class InteractiveSession:
         self._max_steps = max_steps
         self._max_context_chars = max_context_chars
         self._max_context_messages = max_context_messages
+        self._uses_default_read_line = read_line is None
         self._read_line = read_line or input
         self._write_line = write_line or print
         self._renderer_factory = renderer_factory or _new_renderer
@@ -153,13 +155,14 @@ class InteractiveSession:
         return self._workspace
 
     def run(self) -> int:
-        self._write_line(f"CodeLoop · {self._model_name}")
-        self._write_line(str(self._workspace.root))
-        self._write_line("")
+        renderer = self._create_renderer()
+        self._show_startup_banner(renderer)
+        renderer_has_task_state = False
 
         while True:
+            self._show_input_top_rule(renderer)
             try:
-                raw = self._read_line("codeloop > ")
+                raw = self._read_interactive_line(renderer)
             except EOFError:
                 return 0
             except KeyboardInterrupt:
@@ -169,6 +172,11 @@ class InteractiveSession:
             text = raw.strip()
             if not text:
                 continue
+
+            self._show_input_bottom_rule(renderer)
+            if text.casefold() in {"exit", "quit"}:
+                self._show_goodbye(renderer)
+                return 0
 
             command_result = self._handle_command(text)
             if command_result is not None:
@@ -192,10 +200,102 @@ class InteractiveSession:
                     continue
                 task = switch.task
 
-            result = self._run_task(task)
+            if renderer_has_task_state:
+                renderer = self._create_renderer()
+            result = self._run_task(task, renderer)
+            renderer_has_task_state = True
             if result.status in _CONTROLLED_TERMINATIONS:
                 continue
             return _FATAL_EXIT_CODES.get(result.status, 1)
+
+    def _create_renderer(self) -> ConsoleRenderer | None:
+        try:
+            return self._renderer_factory()
+        except Exception:
+            return None
+
+    def _show_startup_banner(
+        self,
+        renderer: ConsoleRenderer | None,
+    ) -> None:
+        callback = (
+            getattr(renderer, "show_startup_banner", None)
+            if renderer is not None
+            else None
+        )
+        if callback is not None and _best_effort(
+            callback,
+            self._model_name,
+            self._workspace.root,
+            "interactive",
+        ):
+            return
+        self._write_line("CodeLoop")
+        self._write_line("")
+        self._write_line("Welcome to CodeLoop")
+        self._write_line("")
+        self._write_line(f"model: {self._model_name}")
+        self._write_line(f"workspace: {self._workspace.root}")
+        self._write_line("mode: interactive")
+        self._write_line("")
+
+    def _show_input_top_rule(
+        self,
+        renderer: ConsoleRenderer | None,
+    ) -> None:
+        callback = (
+            getattr(renderer, "show_input_top_rule", None)
+            if renderer is not None
+            else None
+        )
+        if callback is None or not _best_effort(callback):
+            self._write_line(_fallback_input_rule())
+
+    def _read_interactive_line(
+        self,
+        renderer: ConsoleRenderer | None,
+    ) -> str:
+        if not self._uses_default_read_line:
+            return self._read_line("> ")
+        callback = (
+            getattr(renderer, "read_user_input", None)
+            if renderer is not None
+            else None
+        )
+        if callback is not None:
+            try:
+                return callback()
+            except (EOFError, KeyboardInterrupt):
+                raise
+            except Exception:
+                # Only the default terminal path may fall back to builtin
+                # input. An injected read_line is handled above and is never
+                # replaced when it raises.
+                return self._read_line("> ")
+        return self._read_line("> ")
+
+    def _show_input_bottom_rule(
+        self,
+        renderer: ConsoleRenderer | None,
+    ) -> None:
+        callback = (
+            getattr(renderer, "show_input_bottom_rule", None)
+            if renderer is not None
+            else None
+        )
+        if callback is not None and _best_effort(callback):
+            return
+        self._write_line(_fallback_input_rule())
+        self._write_line("")
+
+    def _show_goodbye(self, renderer: ConsoleRenderer | None) -> None:
+        callback = (
+            getattr(renderer, "show_goodbye", None)
+            if renderer is not None
+            else None
+        )
+        if callback is None or not _best_effort(callback):
+            self._write_line("Bye.")
 
     def _handle_command(self, text: str) -> int | None:
         if not text.startswith("/"):
@@ -248,7 +348,11 @@ class InteractiveSession:
         self._write_line(f"Workspace: {replacement.root}")
         return True
 
-    def _run_task(self, task: str) -> AgentResult:
+    def _run_task(
+        self,
+        task: str,
+        renderer: ConsoleRenderer | None,
+    ) -> AgentResult:
         previous_turns = self._history.snapshot()
         registry = ToolRegistry(
             self._workspace,
@@ -257,10 +361,6 @@ class InteractiveSession:
                 getattr(self._client, "supports_image_input", False)
             ),
         )
-        try:
-            renderer = self._renderer_factory()
-        except Exception:
-            renderer = None
         narration_callback = (
             getattr(renderer, "show_narration", None)
             if renderer is not None
@@ -445,6 +545,11 @@ def _new_renderer() -> ConsoleRenderer | None:
         return ConsoleRenderer()
     except Exception:
         return None
+
+
+def _fallback_input_rule() -> str:
+    width = get_terminal_size(fallback=(80, 24)).columns
+    return "-" * max(20, min(width, 120))
 
 
 def _best_effort(callback: Callable[..., None], *args: Any) -> bool:

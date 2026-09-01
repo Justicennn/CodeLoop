@@ -6,12 +6,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.padding import Padding
+from rich.panel import Panel
 from rich.rule import Rule
 from rich.status import Status
 from rich.style import Style
 from rich.syntax import SyntaxTheme
+from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
@@ -27,6 +30,12 @@ TRUNCATION_MARKER = "... output truncated ..."
 FAILURE_EVIDENCE_CHARS = FAILURE_OUTPUT_LIMIT
 SUCCESS_EVIDENCE_CHARS = SUCCESS_OUTPUT_LIMIT
 OUTPUT_TRUNCATION_MARKER = TRUNCATION_MARKER
+_ACCENT_STYLE = "cyan"
+_PRIMARY_STYLE = "bold white"
+_MUTED_STYLE = "dim"
+_SUCCESS_STYLE = "green"
+_WARNING_STYLE = "yellow"
+_ERROR_STYLE = "red"
 _READ_ONLY_TOOLS = frozenset(
     {
         "repository_overview",
@@ -74,6 +83,53 @@ class ConsoleRenderer:
         task_line.append(task)
         self.console.print(task_line)
         self.console.print()
+
+    def show_startup_banner(
+        self,
+        model: str,
+        workspace: Path,
+        mode: str = "interactive",
+    ) -> None:
+        """Render session chrome without touching task PresentationState."""
+        metadata = Table.grid(padding=(0, 2), expand=False)
+        metadata.add_column(style=_MUTED_STYLE, no_wrap=True)
+        metadata.add_column(style="white", overflow="fold")
+        metadata.add_row("model", model)
+        metadata.add_row("workspace", str(workspace))
+        metadata.add_row("mode", mode)
+
+        content = Group(
+            Text("Welcome to CodeLoop", style=_PRIMARY_STYLE),
+            Text(""),
+            metadata,
+        )
+        self.console.print(
+            Panel(
+                Padding(content, (0, 1)),
+                title=Text(" CodeLoop ", style=f"bold {_ACCENT_STYLE}"),
+                title_align="left",
+                border_style=_ACCENT_STYLE,
+                padding=(1, 1),
+                expand=True,
+            )
+        )
+        self.console.print()
+
+    def show_input_top_rule(self) -> None:
+        """Start one terminal-native user input region."""
+        self.console.print(Rule(style=f"{_MUTED_STYLE} {_ACCENT_STYLE}"))
+
+    def read_user_input(self) -> str:
+        """Read from the renderer's real console with an accented prompt."""
+        return self.console.input(Text("> ", style=f"bold {_ACCENT_STYLE}"))
+
+    def show_input_bottom_rule(self) -> None:
+        """Close one submitted user input region."""
+        self.console.print(Rule(style=f"{_MUTED_STYLE} {_ACCENT_STYLE}"))
+        self.console.print()
+
+    def show_goodbye(self) -> None:
+        self.console.print(Text("Bye.", style=_MUTED_STYLE))
 
     def start_thinking(self) -> None:
         if self._thinking is None:
@@ -227,18 +283,18 @@ class ConsoleRenderer:
 
         if command is None:
             if event.result.get("ok") is True:
-                self._render_heading("✓", "Command completed", "green")
+                self._render_heading("✓", "Command completed", _SUCCESS_STYLE)
             else:
                 title = "run_command"
                 if error_code:
                     title += f" · {error_code}"
-                self._render_heading("⚠", title, "yellow")
+                self._render_heading("⚠", title, _WARNING_STYLE)
                 if message:
                     self.console.print(Text(f"  {message}"))
             return
 
         if event.result.get("ok") is True:
-            self._render_heading("✓", command, "green")
+            self._render_heading("✓", command, _SUCCESS_STYLE)
             evidence = _select_success_evidence(data)
             limit = SUCCESS_OUTPUT_LIMIT
         else:
@@ -248,7 +304,7 @@ class ConsoleRenderer:
                 title += f" · exit {exit_code}"
             elif error_code:
                 title += f" · {error_code}"
-            self._render_heading("✗", title, "red")
+            self._render_heading("✗", title, _ERROR_STYLE)
             evidence = _select_failure_evidence(data)
             limit = FAILURE_OUTPUT_LIMIT
 
