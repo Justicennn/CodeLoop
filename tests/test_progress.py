@@ -11,6 +11,7 @@ import pytest
 
 import codeloop.agent.runner as runner_module
 from codeloop.agent.context import ConversationContext
+from codeloop.agent.events import RecoveryEvent
 from codeloop.agent.plan import PlanStep, TaskPlan, UPDATE_PLAN_ACTION_NAME
 from codeloop.agent.progress import (
     RECENT_DIGEST_LIMIT,
@@ -529,16 +530,20 @@ def test_runner_injects_recovery_then_terminates_no_progress(
     (tmp_path / "value.txt").write_text("value", encoding="utf-8")
     client = FakeClient([_read_response(f"read-{index}") for index in range(7)])
 
+    recovery_events: list[RecoveryEvent] = []
     result = AgentRunner(
         client,
         tools=ToolRegistry(Workspace(tmp_path)),
         max_steps=7,
+        on_recovery_event=recovery_events.append,
     ).run("Keep reading the same file.")
 
     assert result.status == "no_progress"
     assert result.steps == 7
     assert result.workspace_revision == 0
     assert result.verification_status == "not_required"
+    assert len(recovery_events) == 1
+    assert recovery_events[0].reason == "no_progress"
     recovery_snapshot = client.calls[4]["messages"][0]["content"]
     assert '"progress"' in recovery_snapshot
     assert '"status":"possible_stall"' in recovery_snapshot

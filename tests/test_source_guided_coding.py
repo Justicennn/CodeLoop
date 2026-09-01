@@ -802,18 +802,18 @@ def test_web_read_and_requirement_action_share_sequential_turn_evidence(
 
 def test_prompt_fixes_source_and_verification_policy() -> None:
     prompt = SYSTEM_PROMPT
-    assert "Read it sequentially through next_cursor" in prompt
-    assert "do not claim that the whole document was understood" in prompt
-    assert "functional, constraint, acceptance, and reference" in prompt
-    assert "a reference item is not automatically a hard requirement" in prompt
-    assert "Keep source requirements separate from Agent design decisions" in prompt
-    assert "Use the existing TaskPlan and coding loop" in prompt
-    assert "implemented but not automatically verified" in prompt
-    assert "use read_webpage" in prompt
-    assert "do not discover links, crawl a site, or guess content" in prompt
-    assert "normally cite the requested_url" in prompt
-    assert "use read_image" in prompt
-    assert "A filename is only a source label" in prompt
-    assert "One image may support multiple functional" in prompt
-    assert "Every model decision that calls read_image must contain only read_image calls" in prompt
-    assert "Never mix read_image with another Tool or Core Action" in prompt
+    assert "next_cursor" in prompt
+    assert "不得声称已经理解整份文档" in prompt
+    for kind in ("functional", "constraint", "acceptance", "reference"):
+        assert kind in prompt
+    assert "来源需求与 Agent 的设计决策" in prompt
+    assert "TaskPlan" in prompt and "编码循环" in prompt
+    assert "已实现但未自动验证" in prompt
+    assert "read_webpage" in prompt
+    assert "不得发现链接、爬取站点" in prompt
+    assert "requested_url" in prompt and "final_url" in prompt
+    assert "read_image" in prompt
+    assert "文件名只是来源标签" in prompt
+    assert "同一张图片" in prompt
+    assert "只包含 `read_image` 调用" in prompt
+    assert "其他 Tool 或 Core Action" in prompt

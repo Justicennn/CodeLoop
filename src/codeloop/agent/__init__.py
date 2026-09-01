@@ -3,7 +3,13 @@
 from .conversation import PublicConversationTurn
 from .events import (
     CommandApprovalHandler,
+    CoreActionName,
+    CoreActionEvent,
+    CoreActionEventHandler,
     ModelRequestHandler,
+    RecoveryEvent,
+    RecoveryEventHandler,
+    ReviewFindingProjection,
     ToolEvent,
     ToolEventHandler,
 )
@@ -20,6 +26,9 @@ __all__ = [
     "AgentResult",
     "AgentRunner",
     "CommandApprovalHandler",
+    "CoreActionName",
+    "CoreActionEvent",
+    "CoreActionEventHandler",
     "DEFAULT_MAX_STEPS",
     "ModelRequestHandler",
     "PlanStatus",
@@ -29,6 +38,9 @@ __all__ = [
     "ProgressStatus",
     "ProgressTracker",
     "PublicConversationTurn",
+    "RecoveryEvent",
+    "RecoveryEventHandler",
+    "ReviewFindingProjection",
     "RepositoryWorkingSet",
     "Requirement",
     "RequirementSource",

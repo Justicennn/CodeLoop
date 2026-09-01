@@ -17,7 +17,13 @@ from rich.console import Console
 import codeloop.agent.runner as agent_module
 import codeloop.execution.tools as tools_module
 from codeloop.agent.context import ConversationContext
-from codeloop.agent.events import ToolEvent
+from codeloop.agent.events import (
+    CoreActionEvent,
+    RecoveryEvent,
+    ReviewFindingProjection,
+    ToolEvent,
+)
+from codeloop.agent.plan import PlanStep
 from codeloop.prompts import SYSTEM_PROMPT
 from codeloop.agent.runner import (
     DEFAULT_MAX_STEPS,
@@ -60,6 +66,50 @@ class FakeClient:
         if isinstance(action, BaseException):
             raise action
         return action
+
+
+def test_core_action_event_contains_only_its_bounded_projection(
+    tmp_path: Path,
+) -> None:
+    events: list[CoreActionEvent] = []
+    client = FakeClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="requirements",
+                        name="update_requirements",
+                        arguments='{"requirements":[]}',
+                    )
+                ]
+            ),
+            ModelResponse(text="No source requirements were needed."),
+        ]
+    )
+
+    def broken_callback(event: CoreActionEvent) -> None:
+        events.append(event)
+        raise RuntimeError("presentation failed")
+
+    result = AgentRunner(
+        client,
+        tools=ToolRegistry(Workspace(tmp_path)),
+        on_core_action_event=broken_callback,
+    ).run("Inspect only.")
+
+    assert result.status == "completed"
+    assert len(events) == 1
+    event = events[0]
+    assert event.name == "update_requirements"
+    assert event.call_id == "requirements"
+    assert event.result["ok"] is True
+    assert event.requirement_count == 0
+    assert event.requirement_sources == ()
+    assert event.plan_steps is None
+    assert event.review_findings is None
+    assert not hasattr(event, "task_state")
+    assert not hasattr(event, "context")
+    assert not hasattr(event, "tool_call")
 
 
 def test_workspace_rejects_escape(tmp_path: Path) -> None:
@@ -744,6 +794,8 @@ def test_failure_observation_repair_verify_loop(
         client,
         tools=registry,
         on_tool_event=renderer.show_tool_event,
+        on_core_action_event=renderer.show_core_action_event,
+        on_recovery_event=renderer.show_recovery_event,
         on_model_request_started=renderer.start_thinking,
         on_model_request_finished=renderer.stop_thinking,
     ).run("Repair the discount calculator and verify it.")
@@ -786,15 +838,16 @@ def test_failure_observation_repair_verify_loop(
     assert "Traceback" not in output
     assert 'File "' not in output
     assert "OK" in output
-    assert "◆ Updated discount.py · 1 replacement" in output
+    assert "M Updated discount.py · 1 replacement" in output
     assert "-discount_amount = subtotal * discount_percent" not in output
     assert "+discount_amount = subtotal * (discount_percent / 100)" not in output
     assert "--- a/discount.py" not in output
     assert "+++ b/discount.py" not in output
     assert "@@" not in output
     assert "Applied 1 replacement" not in output
-    assert "Done · 5 steps" in output
-    assert "✓ Verified" in output
+    assert "DONE" in output
+    assert "Task completed · 5 steps" in output
+    assert "VERIFICATION" in output
     assert output.count("Changed discount.py") == 1
     assert "Last command" not in output
     assert "Last successful command" not in output
@@ -802,12 +855,14 @@ def test_failure_observation_repair_verify_loop(
     assert "Final answer" not in output
     assert "discounted_total(100, 10)" in output
     assert "print('theme neutral')" in output
-    assert "─" * 80 not in output
+    assert "WORKING" in output
     assert "[observation]" not in output
     assert "dispatch_duration_ms=" not in output
     assert "ms)" not in output
     assert '"ok":' not in output
     assert "baseline" not in output
+    assert "DIAGNOSIS" not in output
+    assert "REPAIR" not in output
     assert "Diagnosing" not in output
     assert "Planning" not in output
     assert "Running tests" not in output
@@ -1068,10 +1123,9 @@ def test_failure_observation_repair_verify_loop(
     assert "Path does not exist: missing.py" in bounded_output
     assert "✓ Created assets" in bounded_output
     assert "✓ Directory ready existing" in bounded_output
-    assert "◆ Wrote new.py" in bounded_output
-    assert "◆ Created new.py" not in bounded_output
-    assert "◆ Updated new.py" not in bounded_output
-    assert "◆ Unchanged same.py" in bounded_output
+    assert "+ Created new.py" in bounded_output
+    assert "M Updated new.py" not in bounded_output
+    assert "✓ Unchanged same.py" in bounded_output
     assert "Command details unavailable" not in bounded_output
     assert "⚠ run_command · invalid_arguments" in bounded_output
     assert bounded_output.count(
@@ -1099,7 +1153,7 @@ def test_failure_observation_repair_verify_loop(
     assert "---" not in bounded_output
     assert "+++" not in bounded_output
     assert "@@" not in bounded_output
-    assert "◆ Updated large.py · 1 replacement" in bounded_output
+    assert "M Updated large.py · 1 replacement" in bounded_output
     assert "(1.2s)" not in bounded_output
     assert "workspace_changed" not in bounded_output
     assert "write-id" not in bounded_output
@@ -1142,9 +1196,9 @@ def test_compact_result_uses_real_verification_and_termination_status() -> None:
         )
     )
     unverified = rendered.getvalue()
-    assert "✓ Done · 3 steps" in unverified
-    assert "⚠ Unverified" in unverified
-    assert "✓ Verified" not in unverified
+    assert "✓ Task completed · 3 steps" in unverified
+    assert "VERIFICATION" in unverified
+    assert "⚠ Managed changes are not verified" in unverified
     assert "Model final answer." in unverified
 
     rendered.seek(0)
@@ -1158,7 +1212,7 @@ def test_compact_result_uses_real_verification_and_termination_status() -> None:
         )
     )
     not_required = rendered.getvalue()
-    assert "✓ Done · 1 steps" in not_required
+    assert "✓ Task completed · 1 steps" in not_required
     assert "Verified" not in not_required
     assert "Unverified" not in not_required
 
@@ -1173,9 +1227,165 @@ def test_compact_result_uses_real_verification_and_termination_status() -> None:
         )
     )
     stopped = rendered.getvalue()
-    assert "✗ Stopped · no_progress" in stopped
+    assert "STOPPED" in stopped
+    assert "✗ no_progress" in stopped
     assert "No material progress was detected." in stopped
     assert "Done" not in stopped
+
+
+def test_structured_sections_render_only_explicit_runtime_facts() -> None:
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=80,
+        )
+    )
+    renderer.show_core_action_event(
+        CoreActionEvent(
+            name="update_requirements",
+            call_id="requirements",
+            result={"ok": True, "data": {"changed": True}},
+            requirement_count=1,
+            requirement_sources=("requirements.md",),
+        )
+    )
+    renderer.show_core_action_event(
+        CoreActionEvent(
+            name="update_plan",
+            call_id="plan",
+            result={"ok": True, "data": {"changed": True}},
+            plan_steps=(
+                PlanStep(id="one", description="Inspect", status="completed"),
+                PlanStep(id="two", description="Implement", status="in_progress"),
+                PlanStep(id="three", description="Verify", status="pending"),
+            ),
+        )
+    )
+    renderer.show_core_action_event(
+        CoreActionEvent(
+            name="update_plan",
+            call_id="plan-update",
+            result={"ok": True, "data": {"changed": True}},
+            plan_steps=(
+                PlanStep(id="one", description="Inspect", status="completed"),
+                PlanStep(id="two", description="Implement", status="completed"),
+                PlanStep(id="three", description="Verify", status="in_progress"),
+            ),
+        )
+    )
+    renderer.show_core_action_event(
+        CoreActionEvent(
+            name="update_review_findings",
+            call_id="review",
+            result={"ok": True, "data": {"changed": True}},
+            review_findings=(
+                ReviewFindingProjection(
+                    finding_type="issue",
+                    title="Explicit finding",
+                    priority="high",
+                ),
+            ),
+        )
+    )
+    for identifier, name, path in (
+        ("create-a", "write_file", "a.py"),
+        ("edit-a", "edit_file", "a.py"),
+        ("edit-b", "edit_file", "b.py"),
+    ):
+        renderer.show_tool_event(
+            ToolEvent(
+                tool_call=ToolCall(
+                    id=identifier,
+                    name=name,
+                    arguments=json.dumps({"path": path}),
+                ),
+                result={
+                    "ok": True,
+                    "data": {"path": path, "workspace_changed": True},
+                },
+                dispatch_duration_ms=1,
+                truncated=False,
+            )
+        )
+    renderer.show_result(
+        AgentResult(status="completed", answer="FINAL_ONCE", steps=4)
+    )
+
+    output = rendered.getvalue()
+    assert "UNDERSTANDING" in output
+    assert "Source: requirements.md" in output
+    assert "1 requirement registered" in output
+    assert "PLAN" in output
+    assert "✓ Inspect" in output
+    assert "● Implement" in output
+    assert "○ Verify" in output
+    assert output.count("Inspect") == 1
+    assert "REVIEW" in output
+    assert "HIGH · issue · Explicit finding" in output
+    assert "CHANGED · 2 files" in output
+    assert "+ created · a.py" in output
+    assert "M modified · b.py" in output
+    assert output.count("FINAL_ONCE") == 1
+    assert "DONE" in output
+    assert "DIAGNOSIS" not in output
+    assert "REPAIR" not in output
+
+
+@pytest.mark.parametrize("width", [80, 140])
+def test_renderer_width_and_explicit_recovery_are_safe(width: int) -> None:
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=width,
+        )
+    )
+    renderer.show_recovery_event(RecoveryEvent())
+    renderer.show_result(
+        AgentResult(status="no_progress", answer=None, steps=4)
+    )
+
+    output = rendered.getvalue()
+    assert "REPAIR" in output
+    assert "Recovery requested after no material progress" in output
+    assert "STOPPED" in output
+
+
+def test_denied_command_is_working_not_verification() -> None:
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=100,
+        )
+    )
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall(
+                id="denied",
+                name="run_command",
+                arguments="{}",
+            ),
+            result={
+                "ok": False,
+                "error_code": "user_denied",
+                "message": "The user did not approve it.",
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+
+    output = rendered.getvalue()
+    assert "WORKING" in output
+    assert "VERIFICATION" not in output
 
 
 def test_public_narration_and_detailed_final_are_rendered_without_inference() -> None:
@@ -1212,71 +1422,29 @@ def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
     )
     assert prompt == resource_prompt
     assert prompt
-    assert "# CodeLoop System Prompt" in prompt
-    assert "## Workspace and Evidence" in prompt
-    assert "## Requirement Sources" in prompt
-    assert "## Visual Sources" in prompt
-    assert "## Verification" in prompt
-    assert "## Final Answer" in prompt
-    assert (
-        "Public narration is optional, not a required response format" in prompt
-    )
-    assert "Producing no narration is always valid" in prompt
-    assert "Do not narrate every read, search, edit, or command" in prompt
-    assert "never provide private reasoning" in prompt
-    assert "Conversational presentation must not reduce execution depth" in prompt
-    assert "without mutating the Workspace unless the user asks" in prompt
-    assert (
-        "Determine advisory versus action-oriented behavior from the user's "
-        "complete intent and conversation context" in prompt
-    )
-    assert "never from keyword or phrase matching" in prompt
-    assert (
-        "examples of ordinary advisory requests only, not routing triggers"
-        in prompt
-    )
-    assert "execute that work with the necessary depth" in prompt
-    assert (
-        "Selective reporting changes final-answer breadth, not execution semantics"
-        in prompt
-    )
-    assert "Match the final answer's scope to the current question" in prompt
-    assert (
-        "one cohesive short paragraph or roughly two to five sentences"
-        in prompt
-    )
-    assert "non-exhaustive by default" in prompt
-    assert "Inspection depth and reporting breadth are independent" in prompt
-    assert "rank the discovered findings by importance" in prompt
-    assert "two to four findings that matter most" in prompt
-    assert (
-        "Do not automatically turn ordinary advice into a complete code review"
-        in prompt
-    )
-    assert "Avoid A/B/C/D or A1/A2 hierarchies" in prompt
-    assert "Detailed evidence such as code locations" in prompt
-    assert "is demand-driven" in prompt
-    assert "the final answer must cover every one of them" in prompt
-    assert "lead with what was actually changed" in prompt
-    assert "then the strongest real verification result" in prompt
-    assert "a few highest-value future directions" in prompt
-    assert "must never omit an executed major-task result" in prompt
-    assert "not a mandatory heading template" in prompt
-    assert (
-        "Tool evidence supports selection but does not all need to be repeated"
-        in prompt
-    )
-    assert "complete and coherent core answer" in prompt
-    assert "Expand fully when detail is explicitly requested" in prompt
-    assert "Always disclose important failures" in prompt
-    assert "Dependency and environment changes are user-controlled" in prompt
-    assert "without explicit user approval" in prompt
-    assert "After user_denied" in prompt
-    assert "After approval_unavailable" in prompt
-    assert (
-        "Simple localized tasks with a clear path do not require an overview or "
-        "working set" in prompt
-    )
+    for heading in (
+        "# CodeLoop 系统提示词",
+        "## Workspace 与证据",
+        "## 需求来源",
+        "## 视觉来源",
+        "## 验证",
+        "## 最终回答",
+    ):
+        assert heading in prompt
+    assert "公开叙述是可选的" in prompt
+    assert "绝不能提供 private reasoning" in prompt
+    assert "完整意图和会话上下文" in prompt
+    assert "绝不能通过关键词或短语匹配" in prompt
+    assert "纯 Review 类任务" in prompt
+    assert "两到四项" in prompt
+    assert "多个显式主要子目标" in prompt
+    assert "实际修改" in prompt
+    assert "最强的真实验证结果" in prompt
+    assert "用户明确要求细节时应充分展开" in prompt
+    assert "依赖和环境变更由用户控制" in prompt
+    assert "user_denied" in prompt
+    assert "approval_unavailable" in prompt
+    assert "简单局部任务不要求 overview 或 working set" in prompt
 
 
 def test_runner_exposes_the_current_action_schema_order(

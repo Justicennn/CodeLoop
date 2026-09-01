@@ -8,7 +8,7 @@ from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from time import perf_counter, sleep
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from ..execution.command_policy import CommandApprovalRequest
 from ..execution.tools import ToolRegistry, ToolResult
@@ -21,7 +21,13 @@ from .context import (
 from .conversation import PublicConversationTurn
 from .events import (
     CommandApprovalHandler,
+    CoreActionName,
+    CoreActionEvent,
+    CoreActionEventHandler,
     ModelRequestHandler,
+    RecoveryEvent,
+    RecoveryEventHandler,
+    ReviewFindingProjection,
     ToolEvent,
     ToolEventHandler,
 )
@@ -160,6 +166,8 @@ class AgentRunner:
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES,
         on_tool_event: ToolEventHandler | None = None,
+        on_core_action_event: CoreActionEventHandler | None = None,
+        on_recovery_event: RecoveryEventHandler | None = None,
         on_command_approval: CommandApprovalHandler | None = None,
         on_model_request_started: ModelRequestHandler | None = None,
         on_model_request_finished: ModelRequestHandler | None = None,
@@ -174,6 +182,8 @@ class AgentRunner:
         self._max_context_chars = max_context_chars
         self._max_context_messages = max_context_messages
         self._on_tool_event = on_tool_event
+        self._on_core_action_event = on_core_action_event
+        self._on_recovery_event = on_recovery_event
         self._on_command_approval = on_command_approval
         self._on_model_request_started = on_model_request_started
         self._on_model_request_finished = on_model_request_finished
@@ -383,6 +393,15 @@ class AgentRunner:
                                 truncated=_tool_result_is_truncated(result),
                             )
                         )
+                    elif (
+                        not invalid_visual_sequence
+                        and tool_call.name in _CORE_ACTION_NAMES
+                        and self._on_core_action_event is not None
+                    ):
+                        _notify_presentation(
+                            self._on_core_action_event,
+                            _core_action_event(tool_call, result, task_state),
+                        )
                     if (
                         not approval_blocked
                         and failures.record(tool_call, result)
@@ -407,6 +426,11 @@ class AgentRunner:
                     after=_progress_facts(task_state),
                     actions=tuple(progress_actions),
                 )
+                if progress_decision == "request_recovery":
+                    _notify_presentation(
+                        self._on_recovery_event,
+                        RecoveryEvent(),
+                    )
                 if progress_decision == "terminate_no_progress":
                     return self._result(
                         task_state,
@@ -582,6 +606,65 @@ def _tool_result_is_truncated(result: ToolResult) -> bool:
     return any(
         data.get(field) is True
         for field in ("truncated", "stdout_truncated", "stderr_truncated")
+    )
+
+
+def _core_action_event(
+    tool_call: ToolCall,
+    result: ToolResult,
+    task_state: TaskState,
+) -> CoreActionEvent:
+    """Project only the successful Action's own bounded state for presentation."""
+    if result.get("ok") is not True:
+        return CoreActionEvent(
+            name=cast(CoreActionName, tool_call.name),
+            call_id=tool_call.id,
+            result=result,
+        )
+    if tool_call.name == UPDATE_REQUIREMENTS_ACTION_NAME:
+        requirements = task_state.requirements.requirements
+        sources = tuple(
+            dict.fromkeys(
+                source
+                for requirement in requirements
+                for source in (requirement.source.path or requirement.source.url,)
+                if source is not None
+            )
+        )
+        return CoreActionEvent(
+            name=UPDATE_REQUIREMENTS_ACTION_NAME,
+            call_id=tool_call.id,
+            result=result,
+            requirement_count=len(requirements),
+            requirement_sources=sources,
+        )
+    if tool_call.name == UPDATE_PLAN_ACTION_NAME:
+        return CoreActionEvent(
+            name=UPDATE_PLAN_ACTION_NAME,
+            call_id=tool_call.id,
+            result=result,
+            plan_steps=(
+                task_state.plan.steps if task_state.plan is not None else ()
+            ),
+        )
+    if tool_call.name == UPDATE_REVIEW_FINDINGS_ACTION_NAME:
+        return CoreActionEvent(
+            name=UPDATE_REVIEW_FINDINGS_ACTION_NAME,
+            call_id=tool_call.id,
+            result=result,
+            review_findings=tuple(
+                ReviewFindingProjection(
+                    title=finding.title,
+                    finding_type=finding.finding_type,
+                    priority=finding.priority,
+                )
+                for finding in task_state.review_state.findings
+            ),
+        )
+    return CoreActionEvent(
+        name=UPDATE_WORKING_SET_ACTION_NAME,
+        call_id=tool_call.id,
+        result={"ok": True},
     )
 
 

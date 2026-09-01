@@ -28,21 +28,16 @@ SUCCESS = {
 
 def test_system_prompt_requires_minimum_sufficient_verification() -> None:
     prompt = SYSTEM_PROMPT
-    assert "Use Minimum Sufficient Verification" in prompt
-    assert "proportionate to the task's size, risk, and concrete evidence" in prompt
-    assert "These are alternatives to select from, not a checklist" in prompt
-    assert "do not create a parallel testing system" in prompt
-    assert "Modification does not imply that a new test must be written" in prompt
-    assert "Once sufficient relevant evidence has been obtained" in prompt
-    assert "stop verifying and proceed to completion" in prompt
-    assert "A failed custom verification helper is not by itself evidence" in prompt
-    assert "stop expanding or repeatedly repairing" in prompt
-    assert (
-        "Completion review does not itself require another verification layer"
-        in prompt
-    )
-    assert "Preserve the test-and-repair loop for concrete bug fixes" in prompt
-    assert "Never pretend a check ran or fabricate a successful result" in prompt
+    assert "Minimum Sufficient Verification" in prompt
+    assert "验证深度必须与任务规模、风险和具体证据相称" in prompt
+    assert "不是必须逐项执行的清单" in prompt
+    assert "不得建立平行测试体系" in prompt
+    assert "不意味着必须新建测试" in prompt
+    assert "停止继续验证并进入完成" in prompt
+    assert "custom verification helper 失败本身不能证明" in prompt
+    assert "Completion Review 本身不要求再增加验证层" in prompt
+    assert "bug fix" in prompt and "test-and-repair loop" in prompt
+    assert "绝不能假装执行过检查或编造成功结果" in prompt
 
 
 FAILURE = {

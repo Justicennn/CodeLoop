@@ -471,35 +471,30 @@ def test_review_fix_invalidates_current_finding_then_reports_fixed(
 
 def test_prompt_requires_evidence_guided_navigation_and_post_edit_recheck() -> None:
     prompt = SYSTEM_PROMPT
-    assert "consider repository_overview first" in prompt
-    assert "Navigate from confirmed repository evidence" in prompt
-    assert "structure returned by repository_overview" in prompt
-    assert "entries returned by a successful list_files call" in prompt
-    assert "match paths returned by search_code" in prompt
-    assert "paths returned by a successful read_file call" in prompt
-    assert "Conventions may form investigation hypotheses" in prompt
-    assert "they are not filesystem facts" in prompt
-    assert "this is not a mandatory mechanical tool order" in prompt
-    assert "only the current investigation focus" in prompt
-    assert "does not prove that a path exists" in prompt
-    assert "is not an allowlist" in prompt
-    assert "Confirm a not-yet-confirmed working-set path" in prompt
-    assert (
-        "treat file_not_found from list_files or read_file as navigation evidence"
-        in prompt
-    )
-    assert "Do not fabricate the path" in prompt
-    assert "immediately guess a sequence of similar directories" in prompt
-    assert "Return to the most recent confirmed repository structure" in prompt
-    assert "Workspace Root remains the only filesystem access boundary" in prompt
-    assert "only an investigation lead" in prompt
-    assert "A search_code match can support a finding directly" in prompt
-    assert "depends on broader control flow, state changes, call relationships" in prompt
-    assert "continue with read_file" in prompt
-    assert "you remain responsible for evidence sufficiency" in prompt
-    assert "Re-read or search the modified implementation" in prompt
-    assert "report it as fixed rather than listing it as a current defect" in prompt
-    assert "run_command filesystem side effects are not tracked" in prompt
+    for tool in ("repository_overview", "list_files", "search_code", "read_file"):
+        assert tool in prompt
+    assert "已确认的仓库证据" in prompt
+    assert "不是文件系统事实" in prompt
+    assert "不是必须机械遵循的 Tool 顺序" in prompt
+    assert "Repository Working Set" in prompt
+    assert "也不是 allowlist" in prompt
+    assert "file_not_found" in prompt
+    assert "不得虚构 path" in prompt
+    assert "Workspace Root" in prompt
+    assert "静态仓库证据" in prompt
+    assert "不主动调用 `run_command`" in prompt
+    assert "先完成与 Review 目标相称的静态理解" in prompt
+    assert "首先建立运行 baseline" in prompt
+    assert "直接相关的最小必要命令" in prompt
+    assert "VERIFICATION" in prompt
+    assert "风险、可能性或待确认项" in prompt
+    assert "说明还缺少的证据" in prompt
+    assert "不得把推测" in prompt
+    assert "search_code" in prompt and "finding" in prompt
+    assert "control flow" in prompt and "read_file" in prompt
+    assert "重新读取或搜索修改后的实现" in prompt
+    assert "fixed" in prompt and "current defect" in prompt
+    assert "run_command" in prompt and "filesystem side effect" in prompt
 
 
 def test_successful_review_bookkeeping_does_not_imitate_material_progress() -> None:

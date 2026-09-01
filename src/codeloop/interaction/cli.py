@@ -44,16 +44,20 @@ EXIT_CODES: dict[TerminationReason, int] = {
 
 def _show_fallback_result(result: AgentResult) -> None:
     if result.status == "completed":
-        print(f"✓ Done · {result.steps} steps")
         if result.verification_status == "verified":
-            print("✓ Verified")
+            print("VERIFICATION")
+            print("✓ Latest recorded command passed")
         elif result.verification_status == "unverified":
-            print("⚠ Unverified")
+            print("VERIFICATION")
+            print("⚠ Managed changes are not verified at the current revision")
+        print("DONE")
+        print(f"✓ Task completed · {result.steps} steps")
         if result.answer:
             print()
             print(result.answer)
         return
-    print(f"✗ Stopped · {result.status}", file=sys.stderr)
+    print("STOPPED", file=sys.stderr)
+    print(f"✗ {result.status}", file=sys.stderr)
     if result.message:
         print(result.message, file=sys.stderr)
 
@@ -232,6 +236,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_context_chars=args.max_context_chars,
             max_context_messages=args.max_context_messages,
             on_tool_event=renderer.show_tool_event if renderer is not None else None,
+            on_core_action_event=(
+                getattr(renderer, "show_core_action_event", None)
+                if renderer is not None
+                else None
+            ),
+            on_recovery_event=(
+                getattr(renderer, "show_recovery_event", None)
+                if renderer is not None
+                else None
+            ),
             on_command_approval=(
                 ConsoleCommandApprover() if _stdin_is_interactive() else None
             ),

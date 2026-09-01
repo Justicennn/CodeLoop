@@ -154,13 +154,12 @@ class InteractiveSession:
 
     def run(self) -> int:
         self._write_line(f"CodeLoop · {self._model_name}")
-        self._write_line(f"Workspace: {self._workspace.root}")
+        self._write_line(str(self._workspace.root))
         self._write_line("")
-        self._write_line("Type /help for commands.")
 
         while True:
             try:
-                raw = self._read_line("> ")
+                raw = self._read_line("codeloop > ")
             except EOFError:
                 return 0
             except KeyboardInterrupt:
@@ -277,6 +276,16 @@ class InteractiveSession:
             max_context_chars=self._max_context_chars,
             max_context_messages=self._max_context_messages,
             on_tool_event=renderer.show_tool_event if renderer is not None else None,
+            on_core_action_event=(
+                getattr(renderer, "show_core_action_event", None)
+                if renderer is not None
+                else None
+            ),
+            on_recovery_event=(
+                getattr(renderer, "show_recovery_event", None)
+                if renderer is not None
+                else None
+            ),
             on_command_approval=self._command_approver,
             on_model_request_started=(
                 renderer.start_thinking if renderer is not None else None
@@ -406,15 +415,21 @@ def _public_assistant_text(result: AgentResult) -> str:
 
 def _fallback_result_text(result: AgentResult) -> str:
     if result.status == "completed":
-        lines = [f"✓ Done · {result.steps} steps"]
+        lines: list[str] = []
         if result.verification_status == "verified":
-            lines.append("✓ Verified")
+            lines.extend(("VERIFICATION", "✓ Latest recorded command passed"))
         elif result.verification_status == "unverified":
-            lines.append("⚠ Unverified")
+            lines.extend(
+                (
+                    "VERIFICATION",
+                    "⚠ Managed changes are not verified at the current revision",
+                )
+            )
+        lines.extend(("DONE", f"✓ Task completed · {result.steps} steps"))
         if result.answer:
             lines.extend(("", result.answer))
         return "\n".join(lines)
-    lines = [f"✗ Stopped · {result.status}"]
+    lines = ["STOPPED", f"✗ {result.status}"]
     if result.message:
         lines.append(result.message)
     return "\n".join(lines)

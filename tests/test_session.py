@@ -242,10 +242,11 @@ def test_interactive_tasks_receive_only_bounded_public_results(
     ]
     assert all(message.get("role") != "tool" for message in second)
     assert "CodeLoop · fake" in output
-    assert f"Workspace: {tmp_path.resolve()}" in output
-    assert "Type /help for commands." in output
-    assert "✓ Done · 1 steps\n\nfirst answer" in output
-    assert "✓ Done · 1 steps\n\nsecond answer" in output
+    assert str(tmp_path.resolve()) in output
+    assert not any(line.startswith("Workspace:") for line in output)
+    assert "Type /help for commands." not in output
+    assert "✓ Task completed · 1 steps\n\nfirst answer" in output
+    assert "✓ Task completed · 1 steps\n\nsecond answer" in output
     assert all("Verified" not in line for line in output)
 
 
@@ -267,7 +268,7 @@ def test_interactive_prompt_is_compact(tmp_path: Path) -> None:
     )
 
     assert session.run() == 0
-    assert prompts == ["> "]
+    assert prompts == ["codeloop > "]
 
 
 def test_redundant_codeloop_invocation_is_not_a_task_or_history_turn(
@@ -827,7 +828,7 @@ def test_cli_one_shot_branch_keeps_original_message_shape(
     ]
     assert client.calls[0]["messages"][-1]["content"] == "one shot"
     output = capsys.readouterr()
-    assert "✓ Done · 1 steps" in output.out
+    assert "✓ Task completed · 1 steps" in output.out
     assert "done" in output.out
     assert "Stopped" not in output.out
     assert output.err == ""

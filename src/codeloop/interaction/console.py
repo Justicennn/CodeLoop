@@ -8,14 +8,17 @@ from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.rule import Rule
 from rich.status import Status
 from rich.style import Style
 from rich.syntax import SyntaxTheme
 from rich.text import Text
 from rich.theme import Theme
 
-from codeloop.agent.events import ToolEvent
+from codeloop.agent.events import CoreActionEvent, RecoveryEvent, ToolEvent
 from codeloop.agent.runner import AgentResult
+
+from .presentation import PresentationBlock, PresentationLine, PresentationState
 
 
 FAILURE_OUTPUT_LIMIT = 1_000
@@ -58,6 +61,7 @@ class ConsoleRenderer:
     def __init__(self, console: Console | None = None) -> None:
         self.console = console or Console()
         self._thinking: Status | None = None
+        self._presentation = PresentationState()
 
     def show_header(self, model: str, workspace: Path, task: str) -> None:
         title = Text("CodeLoop", style="bold cyan")
@@ -66,7 +70,7 @@ class ConsoleRenderer:
         self.console.print(title)
         self.console.print(Text(str(workspace), style="dim"))
         self.console.print()
-        task_line = Text("> ", style="cyan")
+        task_line = Text("codeloop > ", style="green")
         task_line.append(task)
         self.console.print(task_line)
         self.console.print()
@@ -99,9 +103,12 @@ class ConsoleRenderer:
 
     def show_tool_event(self, event: ToolEvent) -> None:
         self.stop_thinking()
-        name = event.tool_call.name
-        if event.result.get("ok") is True and name in _READ_ONLY_TOOLS:
+        self._presentation.record_managed_change(event)
+        section = self._presentation.section_for_tool(event)
+        if section is None:
             return
+        self._render_section(section)
+        name = event.tool_call.name
 
         if name == "run_command":
             self._render_command(event)
@@ -117,6 +124,8 @@ class ConsoleRenderer:
             path = (
                 _string(data.get("path"))
                 or _string(arguments.get("path"))
+                or _string(data.get("requested_url"))
+                or _string(arguments.get("url"))
                 or name
             )
             self._render_tool_failure(event, path)
@@ -124,30 +133,68 @@ class ConsoleRenderer:
             self._render_other_tool(event)
         self.console.print()
 
+    def show_core_action_event(self, event: CoreActionEvent) -> None:
+        self.stop_thinking()
+        block = self._presentation.record_core_action(event)
+        if block is not None:
+            self._render_block(block)
+
+    def show_recovery_event(self, event: RecoveryEvent) -> None:
+        self.stop_thinking()
+        self._render_block(self._presentation.record_recovery(event))
+
     def show_result(self, result: AgentResult) -> None:
         self.stop_thinking()
-        self.console.print()
+        changed = self._presentation.changed_block()
+        if changed is not None:
+            self._render_block(changed)
 
+        if (
+            result.verification_status == "verified"
+            and not self._presentation.has_verification_attempt
+        ):
+            self._render_block(
+                PresentationBlock(
+                    "VERIFICATION",
+                    (
+                        PresentationLine(
+                            "✓",
+                            "Latest recorded command passed",
+                            "green",
+                        ),
+                    ),
+                )
+            )
+        elif result.verification_status == "unverified":
+            self._render_block(
+                PresentationBlock(
+                    "VERIFICATION",
+                    (
+                        PresentationLine(
+                            "⚠",
+                            "Managed changes are not verified at the current revision",
+                            "yellow",
+                        ),
+                    ),
+                )
+            )
+
+        section = "DONE" if result.status == "completed" else "STOPPED"
+        self._render_section(section)
         if result.status == "completed":
-            status = Text("✓ Done", style="bold green")
-            status.append(f" · {result.steps} steps")
+            self._render_heading(
+                "✓",
+                f"Task completed · {result.steps} steps",
+                "green",
+            )
         else:
-            status = Text("✗ Stopped", style="bold red")
-            status.append(f" · {result.status}")
-        self.console.print(status)
-
+            self._render_heading("✗", result.status, "red")
         if result.message:
-            self.console.print(Text(result.message))
-
-        if result.status == "completed":
-            if result.verification_status == "verified":
-                self.console.print(Text("✓ Verified", style="green"))
-            elif result.verification_status == "unverified":
-                self.console.print(Text("⚠ Unverified", style="yellow"))
+            self.console.print(Text(f"  {result.message}"))
 
         if result.status == "completed" and result.answer:
-            answer = _compact_answer_spacing(result.answer)
-            if answer:
+            answer = result.answer
+            if answer.strip():
                 self.console.print()
                 with self.console.use_theme(
                     Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
@@ -158,6 +205,18 @@ class ConsoleRenderer:
                             code_theme=_TERMINAL_NATIVE_SYNTAX_THEME,
                         )
                     )
+        self.console.print()
+
+    def _render_block(self, block: PresentationBlock) -> None:
+        self._render_section(block.section)
+        for line in block.lines:
+            self._render_heading(line.marker, line.text, line.style)
+            if line.detail:
+                self.console.print(Text(f"  {line.detail}", style="dim"))
+        self.console.print()
+
+    def _render_section(self, title: str) -> None:
+        self.console.print(Rule(title, align="left", style="dim"))
 
     def _render_command(self, event: ToolEvent) -> None:
         raw_data = event.result.get("data")
@@ -207,21 +266,21 @@ class ConsoleRenderer:
             return
 
         if data.get("workspace_changed") is not True:
-            self._render_heading("◆", f"Unchanged {path}", "green")
+            self._render_heading("✓", f"Unchanged {path}", "green")
             return
         title = f"Updated {path}"
         replacements = _integer(data.get("replacements"))
         if replacements is not None:
             noun = "replacement" if replacements == 1 else "replacements"
             title += f" · {replacements} {noun}"
-        self._render_heading("◆", title, "green")
+        self._render_heading("M", title, "green")
 
     def _render_write(self, event: ToolEvent) -> None:
         arguments = _object_arguments(event.tool_call.arguments)
         data = _result_data(event)
         path = _string(data.get("path")) or _string(arguments.get("path")) or "write_file"
         if event.result.get("ok") is True:
-            self._render_heading("◆", f"Wrote {path}", "green")
+            self._render_heading("+", f"Created {path}", "green")
         else:
             self._render_tool_failure(event, path)
 
