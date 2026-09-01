@@ -20,8 +20,8 @@ from ..agent.runner import (
 from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import ModelClient
-from .approval import ConsoleCommandApprover
 from .console import ConsoleRenderer
+from .console_interaction import ConsoleInteractionProvider
 from .narration import _NarratingModelClient
 
 DEFAULT_MAX_SESSION_PAIRS = 6
@@ -41,6 +41,7 @@ _CONTROLLED_TERMINATIONS: frozenset[TerminationReason] = frozenset(
 _FATAL_EXIT_CODES: dict[TerminationReason, int] = {
     "fatal_api_error": 2,
     "runtime_error": 1,
+    "interaction_required": 1,
 }
 _NATURAL_WORKSPACE_PREFIXES = (
     "切换到",
@@ -144,10 +145,6 @@ class InteractiveSession:
         self._read_line = read_line or input
         self._write_line = write_line or print
         self._renderer_factory = renderer_factory or _new_renderer
-        self._command_approver = ConsoleCommandApprover(
-            read_line=self._read_line,
-            write_line=self._write_line,
-        )
         self._history = SessionHistory()
 
     @property
@@ -424,7 +421,13 @@ class InteractiveSession:
                 if renderer is not None
                 else None
             ),
-            on_command_approval=self._command_approver,
+            interaction_provider=ConsoleInteractionProvider(
+                read_line=(
+                    None if self._uses_default_read_line else self._read_line
+                ),
+                write_line=self._write_line,
+                renderer=renderer,
+            ),
             on_model_request_started=(
                 renderer.start_thinking if renderer is not None else None
             ),
@@ -572,7 +575,7 @@ def _fallback_result_text(result: AgentResult) -> str:
                     "⚠ Managed changes are not verified at the current revision",
                 )
             )
-        lines.extend(("DONE", f"✓ Task completed · {result.steps} steps"))
+        lines.append(f"✓ Task completed · {result.steps} steps")
         if result.answer:
             lines.extend(("", result.answer))
         return "\n".join(lines)
@@ -596,7 +599,7 @@ def _new_renderer() -> ConsoleRenderer | None:
 
 def _fallback_input_rule() -> str:
     width = get_terminal_size(fallback=(80, 24)).columns
-    return "-" * max(20, min(width, 120))
+    return "-" * max(1, width - 1)
 
 
 def _best_effort(callback: Callable[..., None], *args: Any) -> bool:

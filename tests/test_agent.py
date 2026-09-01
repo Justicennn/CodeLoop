@@ -43,7 +43,9 @@ from codeloop.interaction.console import (
     _bounded_text,
     _get_content_width,
     _get_horizontal_margin,
+    _get_layout_widths,
     _get_safe_terminal_width,
+    _normalize_final_markdown_soft_breaks,
 )
 from codeloop.model.client import ModelAPIError, ModelResponse, ToolCall
 
@@ -780,6 +782,7 @@ def test_failure_observation_repair_verify_loop(
         ]
     )
     registry = ToolRegistry(Workspace(workspace_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
     rendered = StringIO()
     renderer = ConsoleRenderer(
         console=Console(
@@ -1255,6 +1258,11 @@ def test_responsive_presentation_widths_share_pure_bounded_geometry() -> None:
         assert left == 0
         assert right == safe_width - content_width
 
+    layout = _get_layout_widths(140)
+    assert layout.viewport == 139
+    assert layout.reading == _get_content_width(layout.viewport)
+    assert layout.left + layout.reading + layout.right == layout.viewport
+
 
 def test_final_markdown_headings_use_focused_brand_style() -> None:
     for level in range(1, 7):
@@ -1291,6 +1299,105 @@ def test_final_markdown_headings_use_focused_brand_style() -> None:
     assert body_line.startswith("Body.")
 
 
+def test_final_markdown_normalizes_only_logical_soft_breaks(
+    tmp_path: Path,
+) -> None:
+    raw_final = (
+        "技术栈是 HTML + CSS + 原生\n"
+        "JS，没有任何框架。\n\n"
+        "renderStats 基于\n"
+        "getFilteredTasks()。\n\n"
+        "这可能是设计意\n"
+        "图。"
+    )
+    result = AgentRunner(
+        FakeClient([ModelResponse(text=raw_final)]),
+        tools=ToolRegistry(Workspace(tmp_path)),
+    ).run("分析项目。")
+
+    assert result.answer is not None
+    serialized = repr(result.answer)
+    assert "原生\\nJS" in serialized
+    assert "基于\\ngetFilteredTasks()" in serialized
+    assert "设计意\\n图" in serialized
+
+    prose = "技术栈是 HTML + CSS + 原生\nJS，没有任何框架。"
+    ordered = (
+        "2. 统计数字是“筛选后”的：renderStats 基于\n"
+        "   getFilteredTasks()，所以……"
+    )
+    unordered = "- renderStats 基于\n  getFilteredTasks()。"
+    bullets = "- 第一项\n- 第二项"
+    heading = "## 标题\n\n正文"
+    fenced = "```js\nconst first = 1;\nconst second = 2;\n```"
+    table = "| 名称 | 值 |\n| --- | --- |\n| A | B |"
+    prose_with_pipe = "普通正文 A | B\n仍属于同一段。"
+    blockquote = "> 第一行\n> 第二行"
+    horizontal_rule = "前文\n\n---\n\n后文"
+    hard_break = "第一行  \n第二行"
+    backslash_hard_break = "第一行\\" + "\n第二行"
+
+    assert _normalize_final_markdown_soft_breaks(prose) == (
+        "技术栈是 HTML + CSS + 原生 JS，没有任何框架。"
+    )
+    assert _normalize_final_markdown_soft_breaks(ordered) == (
+        "2. 统计数字是“筛选后”的：renderStats 基于 "
+        "getFilteredTasks()，所以……"
+    )
+    assert _normalize_final_markdown_soft_breaks(unordered) == (
+        "- renderStats 基于 getFilteredTasks()。"
+    )
+    assert _normalize_final_markdown_soft_breaks(bullets) == bullets
+    assert _normalize_final_markdown_soft_breaks(heading) == heading
+    assert _normalize_final_markdown_soft_breaks(fenced) == fenced
+    assert _normalize_final_markdown_soft_breaks(table) == table
+    assert _normalize_final_markdown_soft_breaks(prose_with_pipe) == (
+        "普通正文 A | B 仍属于同一段。"
+    )
+    assert _normalize_final_markdown_soft_breaks(blockquote) == blockquote
+    assert (
+        _normalize_final_markdown_soft_breaks(horizontal_rule)
+        == horizontal_rule
+    )
+    assert _normalize_final_markdown_soft_breaks(hard_break) == hard_break
+    assert (
+        _normalize_final_markdown_soft_breaks(backslash_hard_break)
+        == backslash_hard_break
+    )
+
+    combined = "\n\n".join(
+        (
+            prose,
+            ordered,
+            bullets,
+            heading,
+            fenced,
+            table,
+            prose_with_pipe,
+            blockquote,
+            horizontal_rule,
+            hard_break,
+            backslash_hard_break,
+        )
+    )
+    normalized = _normalize_final_markdown_soft_breaks(combined)
+    assert _normalize_final_markdown_soft_breaks(normalized) == normalized
+
+    rendered = StringIO()
+    ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=200,
+        )
+    ).show_result(result)
+    output = rendered.getvalue()
+    assert "原生 JS" in output
+    assert "基于 getFilteredTasks()" in output
+    assert "设计意图" in output
+
+
 def test_owned_tty_input_redraw_is_single_attempt_and_bounded() -> None:
     class InputConsole(Console):
         def __init__(self) -> None:
@@ -1323,6 +1430,16 @@ def test_owned_tty_input_redraw_is_single_attempt_and_bounded() -> None:
 
     assert len(console.controls) == 1
     assert "❯ Review this project" in console.file.getvalue()
+
+    resized_console = InputConsole()
+    resized_renderer = ConsoleRenderer(console=resized_console)
+    resized_renderer.show_input_top_rule()
+    resized_renderer.read_user_input()
+    resized_console._width = 120
+    resized_renderer.show_submitted_user_message("Review this project")
+
+    assert len(resized_console.controls) == 1
+    assert "❯ Review this project" in resized_console.file.getvalue()
 
     unsafe_console = InputConsole()
     unsafe_renderer = ConsoleRenderer(console=unsafe_console)
@@ -1730,10 +1847,17 @@ def test_system_prompt_locks_optional_narration_and_answer_scope() -> None:
     assert "多个显式主要子目标" in prompt
     assert "实际修改" in prompt
     assert "最强的真实验证结果" in prompt
+    assert "不要为了 terminal width 手工 hard-wrap prose" in prompt
+    assert "terminal renderer 负责视觉 wrapping" in prompt
     assert "用户明确要求细节时应充分展开" in prompt
     assert "依赖和环境变更由用户控制" in prompt
     assert "user_denied" in prompt
     assert "approval_unavailable" in prompt
+    assert "request_user_input" in prompt
+    assert "INFORM" in prompt
+    assert "RE_APPROVE" in prompt
+    assert "run_command.authorization_basis" in prompt
+    assert "任何测试执行都不得静默发生" in prompt
     assert "简单局部任务不要求 overview 或 working set" in prompt
 
 
@@ -1755,6 +1879,7 @@ def test_runner_exposes_the_current_action_schema_order(
         "update_requirements",
         "update_working_set",
         "update_review_findings",
+        "request_user_input",
         "repository_overview",
         "list_files",
         "read_file",

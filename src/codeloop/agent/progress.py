@@ -53,6 +53,12 @@ _CORE_STATE_ACTIONS = {
     UPDATE_WORKING_SET_ACTION_NAME,
     UPDATE_REVIEW_FINDINGS_ACTION_NAME,
 }
+_NON_DISPATCH_CONTROL_ERRORS = {
+    "approval_unavailable",
+    "interaction_required",
+    "permission_denied",
+    "user_denied",
+}
 
 
 @dataclass
@@ -185,6 +191,12 @@ class ProgressTracker:
 
     @staticmethod
     def _is_material_observation(action: ProgressAction) -> bool:
+        if action.result.get("error_code") in _NON_DISPATCH_CONTROL_ERRORS:
+            # Human-control outcomes are important recoverable Observations,
+            # but no Execution action ran and no new workspace/runtime evidence
+            # was obtained. Repeating them must remain eligible for bounded
+            # no-progress recovery rather than refreshing progress once.
+            return False
         if action.name in _CORE_STATE_ACTIONS:
             return action.result.get("ok") is False
         if action.name in _MUTATION_TOOLS:

@@ -7,19 +7,21 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 import pytest
 
 import codeloop.agent.runner as runner_module
 from codeloop.agent.runner import AgentRunner
 from codeloop.agent.task_state import TaskState
+from codeloop.control import InteractionAction, InteractionRequest, InteractionResponse
 from codeloop.execution.command_policy import (
-    CommandApprovalRequest,
-    dependency_mutation_request,
+    describe_command,
+    is_dependency_mutation,
 )
 from codeloop.execution.tools import RUN_COMMAND_SCHEMA, ToolDefinition, ToolRegistry
 from codeloop.execution.workspace import Workspace
-from codeloop.interaction.approval import ConsoleCommandApprover
+from codeloop.interaction.console_interaction import ConsoleInteractionProvider
 from codeloop.model.client import ModelResponse, ToolCall
 
 
@@ -37,6 +39,22 @@ class FakeClient:
             {"messages": deepcopy(messages), "tools": deepcopy(tools)}
         )
         return next(self._responses)
+
+
+class CallbackInteractionProvider:
+    def __init__(self, callback: Callable[[InteractionRequest], Any]) -> None:
+        self.callback = callback
+
+    def interact(self, request: InteractionRequest) -> InteractionResponse:
+        value = self.callback(request)
+        if value is None:
+            return InteractionResponse(status="unavailable")
+        approved = value is True
+        return InteractionResponse(
+            status="answered",
+            answer="approved" if approved else "denied",
+            approved=approved,
+        )
 
 
 MUTATING_COMMANDS = [
@@ -77,33 +95,31 @@ MUTATING_COMMANDS = [
 ]
 
 
-def test_approval_request_is_immutable_and_has_only_fixed_policy_fields() -> None:
-    request = CommandApprovalRequest(command=("npm", "ci"))
+def test_command_description_is_immutable_and_contains_only_facts() -> None:
+    description = describe_command(
+        ("npm", "ci"),
+        cwd=".",
+        timeout_seconds=10,
+    )
 
-    assert tuple(item.name for item in fields(request)) == (
+    assert tuple(item.name for item in fields(description)) == (
         "command",
+        "display_command",
+        "cwd",
+        "timeout_seconds",
         "category",
         "reason",
     )
-    assert request.category == "dependency_mutation"
+    assert description.category == "dependency_change"
     with pytest.raises(FrozenInstanceError):
-        request.command = ("npm", "install")  # type: ignore[misc]
-    with pytest.raises(TypeError):
-        CommandApprovalRequest(  # type: ignore[call-arg]
-            command=("npm", "ci"),
-            category="other",
-        )
+        description.command = ("npm", "install")  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("command", MUTATING_COMMANDS)
 def test_explicit_dependency_mutation_forms_require_approval(
     command: list[str],
 ) -> None:
-    request = dependency_mutation_request(command)
-
-    assert request is not None
-    assert request.command == tuple(command)
-    assert request.category == "dependency_mutation"
+    assert is_dependency_mutation(command) is True
 
 
 @pytest.mark.parametrize(
@@ -130,7 +146,7 @@ def test_explicit_dependency_mutation_forms_require_approval(
 def test_read_only_ordinary_and_unlisted_forms_do_not_claim_protection(
     command: list[str],
 ) -> None:
-    assert dependency_mutation_request(command) is None
+    assert is_dependency_mutation(command) is False
 
 
 @pytest.mark.parametrize(
@@ -150,8 +166,8 @@ def test_wrapper_scanning_is_deliberately_conservative_and_deterministic(
     """Wrapper scanning is deliberately conservative and deterministic;
     it does not claim shell-semantic precision.
     """
-    assert dependency_mutation_request(command) is not None
-    assert dependency_mutation_request(command) == dependency_mutation_request(command)
+    assert is_dependency_mutation(command) is True
+    assert is_dependency_mutation(command) == is_dependency_mutation(command)
 
 
 def _registry_with_safe_run_handler(
@@ -227,7 +243,9 @@ def test_approved_dependency_command_dispatches_only_after_callback(
     result = AgentRunner(
         client,
         tools=registry,
-        on_command_approval=lambda _request: order.append("approval") or True,
+        interaction_provider=CallbackInteractionProvider(
+            lambda _request: order.append("approval") or True
+        ),
     ).run("Install only if approved")
 
     assert result.status == "completed"
@@ -255,14 +273,22 @@ def test_denied_or_unavailable_dependency_command_never_dispatches(
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, dispatched),
-        on_command_approval=callback,
+        interaction_provider=(
+            CallbackInteractionProvider(callback)
+            if callback is not None
+            else None
+        ),
     ).run("Run tests")
 
-    observation = _latest_tool_result(client)
     assert dispatched == []
-    assert observation["ok"] is False
-    assert observation["error_code"] == error_code
-    assert observation["data"]["category"] == "dependency_mutation"
+    if callback is None:
+        assert result.status == "interaction_required"
+        assert len(client.calls) == 1
+    else:
+        observation = _latest_tool_result(client)
+        assert observation["ok"] is False
+        assert observation["error_code"] == error_code
+        assert observation["data"]["category"] == "dependency_change"
     assert result.last_verification is None
     assert result.workspace_revision == 0
 
@@ -271,18 +297,18 @@ def test_approval_callback_exception_fails_closed(tmp_path: Path) -> None:
     dispatched: list[dict[str, Any]] = []
     client = _run_command_client(["npm", "ci"])
 
-    def broken(_request: CommandApprovalRequest) -> bool:
+    def broken(_request: InteractionRequest) -> bool:
         raise RuntimeError("presentation failed")
 
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, dispatched),
-        on_command_approval=broken,
+        interaction_provider=CallbackInteractionProvider(broken),
     ).run("Run tests")
 
     assert dispatched == []
-    assert _latest_tool_result(client)["error_code"] == "approval_unavailable"
-    assert result.status == "completed"
+    assert result.status == "interaction_required"
+    assert len(client.calls) == 1
 
 
 def test_confirmation_eof_is_approval_unavailable(tmp_path: Path) -> None:
@@ -292,16 +318,19 @@ def test_confirmation_eof_is_approval_unavailable(tmp_path: Path) -> None:
     def eof(_prompt: str) -> str:
         raise EOFError
 
-    approver = ConsoleCommandApprover(read_line=eof, write_line=lambda _line: None)
+    approver = ConsoleInteractionProvider(
+        read_line=eof,
+        write_line=lambda _line: None,
+    )
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, dispatched),
-        on_command_approval=approver,
+        interaction_provider=approver,
     ).run("Run tests")
 
     assert dispatched == []
-    assert _latest_tool_result(client)["error_code"] == "approval_unavailable"
-    assert result.status == "completed"
+    assert result.status == "interaction_required"
+    assert len(client.calls) == 1
 
 
 def test_confirmation_keyboard_interrupt_keeps_user_interrupt(
@@ -313,14 +342,14 @@ def test_confirmation_keyboard_interrupt_keeps_user_interrupt(
     def interrupt(_prompt: str) -> str:
         raise KeyboardInterrupt
 
-    approver = ConsoleCommandApprover(
+    approver = ConsoleInteractionProvider(
         read_line=interrupt,
         write_line=lambda _line: None,
     )
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, dispatched),
-        on_command_approval=approver,
+        interaction_provider=approver,
     ).run("Run tests")
 
     assert dispatched == []
@@ -331,7 +360,7 @@ def test_confirmation_keyboard_interrupt_keeps_user_interrupt(
 def test_invalid_run_command_arguments_do_not_request_approval(
     tmp_path: Path,
 ) -> None:
-    approvals: list[CommandApprovalRequest] = []
+    approvals: list[InteractionRequest] = []
     client = FakeClient(
         [
             ModelResponse(
@@ -355,7 +384,9 @@ def test_invalid_run_command_arguments_do_not_request_approval(
     AgentRunner(
         client,
         tools=ToolRegistry(Workspace(tmp_path)),
-        on_command_approval=lambda request: approvals.append(request) or True,
+        interaction_provider=CallbackInteractionProvider(
+            lambda request: approvals.append(request) or True
+        ),
     ).run("Run tests")
 
     assert approvals == []
@@ -384,7 +415,9 @@ def test_denial_does_not_replace_existing_verification_attempt(
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, []),
-        on_command_approval=lambda _request: False,
+        interaction_provider=CallbackInteractionProvider(
+            lambda _request: False
+        ),
     ).run("Run tests")
 
     assert state.verification.last_attempt is previous_attempt
@@ -392,18 +425,20 @@ def test_denial_does_not_replace_existing_verification_attempt(
     assert result.verified_revision == 1
 
 
-def test_ordinary_command_does_not_request_approval(tmp_path: Path) -> None:
-    approvals: list[CommandApprovalRequest] = []
+def test_test_command_uses_runtime_approval(tmp_path: Path) -> None:
+    approvals: list[InteractionRequest] = []
     dispatched: list[dict[str, Any]] = []
     client = _run_command_client(["python", "-m", "pytest"])
 
     AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, dispatched),
-        on_command_approval=lambda request: approvals.append(request) or True,
+        interaction_provider=CallbackInteractionProvider(
+            lambda request: approvals.append(request) or True
+        ),
     ).run("Run tests")
 
-    assert approvals == []
+    assert [request.kind for request in approvals] == ["approve"]
     assert len(dispatched) == 1
 
 
@@ -426,7 +461,9 @@ def test_repeated_denials_use_progress_recovery_not_repeated_failure(
     result = AgentRunner(
         client,
         tools=_registry_with_safe_run_handler(tmp_path, []),
-        on_command_approval=lambda _request: False,
+        interaction_provider=CallbackInteractionProvider(
+            lambda _request: False
+        ),
     ).run("Run tests")
 
     assert result.status == "completed"
@@ -455,14 +492,27 @@ def test_console_approver_is_per_command_and_defaults_to_no(
         prompts.append(prompt)
         return answer
 
-    request = CommandApprovalRequest(command=("npm", "ci"))
-    result = ConsoleCommandApprover(
+    request = InteractionRequest(
+        kind="approve",
+        prompt="This command changes dependencies.",
+        action=InteractionAction(
+            description="Install dependencies",
+            category="dependency_change",
+            command=("npm", "ci"),
+            cwd=".",
+            workspace_root="C:/workspace",
+        ),
+    )
+    result = ConsoleInteractionProvider(
         read_line=read_line,
         write_line=output.append,
-    )(request)
+    ).interact(request)
 
-    assert result is approved
-    assert prompts == ["Proceed? [y/N]: "]
-    assert output[0] == "⚠ Dependency change"
-    assert "npm ci" in output[1]
-    assert request.reason in output[2]
+    assert result.approved is approved
+    assert prompts == ["是否继续？[y/N]："]
+    assert output[0] == "需要确认"
+    assert any("npm ci" in line for line in output)
+    assert request.prompt in output
+    assert "工作目录：当前项目根目录" in output
+    assert "C:/workspace" in output
+    assert all("工作目录：." not in line for line in output)

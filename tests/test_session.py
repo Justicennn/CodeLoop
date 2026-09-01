@@ -519,7 +519,7 @@ def test_task_runtime_state_and_tool_cycles_do_not_leak_to_next_task(
         client,
         model_name="fake",
         workspace=Workspace(tmp_path),
-        read_line=_input(["build", "review", "/exit"]),
+        read_line=_input(["build", "y", "review", "/exit"]),
         write_line=lambda _line: None,
         renderer_factory=lambda: None,
     )
@@ -918,9 +918,15 @@ def test_interactive_dependency_confirmation_defaults_to_denial(
     )
 
     assert session.run() == 0
-    observation = json.loads(client.calls[1]["messages"][-1]["content"])
+    observation_message = next(
+        message
+        for message in client.calls[1]["messages"]
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "install"
+    )
+    observation = json.loads(observation_message["content"])
     assert observation["error_code"] == "user_denied"
-    assert "⚠ Dependency change" in output
+    assert "需要确认" in output
     assert any("pip install numpy" in line for line in output)
 
 
@@ -963,10 +969,11 @@ def test_one_shot_dependency_confirmation_fails_closed_without_tty(
     monkeypatch.setattr(cli_module, "ConsoleRenderer", lambda: None)
     monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
 
-    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 0
-    observation = json.loads(client.calls[1]["messages"][-1]["content"])
-    assert observation["error_code"] == "approval_unavailable"
-    assert "Verification remains blocked." in capsys.readouterr().out
+    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 1
+    assert len(client.calls) == 1
+    captured = capsys.readouterr()
+    assert "interaction_required" in captured.err
+    assert "Verification remains blocked." not in captured.out
 
 
 def test_one_shot_tty_check_failure_is_non_interactive(
@@ -981,7 +988,7 @@ def test_one_shot_tty_check_failure_is_non_interactive(
     assert cli_module._stdin_is_interactive() is False
 
 
-def test_one_shot_interactive_confirmation_is_injected_before_dispatch(
+def test_one_shot_never_prompts_or_dispatches_without_a_response(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -995,11 +1002,6 @@ def test_one_shot_interactive_confirmation_is_injected_before_dispatch(
     monkeypatch.setattr(cli_module, "ConsoleRenderer", lambda: None)
     monkeypatch.setattr(cli_module, "ToolRegistry", lambda *_args, **_kwargs: registry)
     monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
-    monkeypatch.setattr(
-        cli_module,
-        "ConsoleCommandApprover",
-        lambda: (lambda _request: True),
-    )
-
-    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 0
-    assert len(dispatched) == 1
+    assert cli_module.main(["run tests", "--workspace", str(tmp_path)]) == 1
+    assert dispatched == []
+    assert len(client.calls) == 1

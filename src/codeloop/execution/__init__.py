@@ -1,17 +1,25 @@
 """Local execution layer public surface."""
 
-from .command_policy import CommandApprovalRequest, dependency_mutation_request
-from .tools import ToolRegistry, ToolResult
+from .command_policy import (
+    CommandDescription,
+    CommandTestScope,
+    describe_command,
+    is_dependency_mutation,
+)
+from .tools import CommandPreflight, ToolRegistry, ToolResult
 from .visual_sources import VisualAttachment, VisualSourceAdapter
 from .workspace import Workspace, WorkspaceError
 
 __all__ = [
-    "CommandApprovalRequest",
+    "CommandDescription",
+    "CommandTestScope",
+    "CommandPreflight",
     "ToolRegistry",
     "ToolResult",
     "VisualAttachment",
     "VisualSourceAdapter",
     "Workspace",
     "WorkspaceError",
-    "dependency_mutation_request",
+    "describe_command",
+    "is_dependency_mutation",
 ]

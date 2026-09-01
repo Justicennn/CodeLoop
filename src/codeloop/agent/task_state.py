@@ -25,8 +25,8 @@ PlanOutcome = Literal[
 ]
 CompletionReviewFingerprint = tuple[int, int, VerificationStatus, tuple[str, ...]]
 _COMPLETION_REVIEW_INSTRUCTION = (
-    "Continue the task: finish or block active plan steps, run a relevant "
-    "verification command, or explain why completion remains limited."
+    "Continue the task: finish or block active plan steps, then complete with "
+    "an evidence-based answer that accurately discloses remaining limits."
 )
 MAX_INSPECTED_EVIDENCE_PATHS = 512
 MAX_READ_SOURCE_PATHS = 128
@@ -323,8 +323,6 @@ class TaskState:
         reasons: list[str] = []
         if self.plan_status == "active":
             reasons.append("active_plan")
-        if self.verification_status == "unverified":
-            reasons.append("unverified_workspace")
         return tuple(reasons)
 
     def _completion_review_fingerprint(self) -> CompletionReviewFingerprint:

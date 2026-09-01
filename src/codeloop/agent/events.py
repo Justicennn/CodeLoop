@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-from ..execution.command_policy import CommandApprovalRequest
 from ..execution.tools import ToolResult
 from ..model.client import ToolCall
 from .plan import PlanStep
@@ -25,6 +24,7 @@ CoreActionName = Literal[
     "update_requirements",
     "update_working_set",
     "update_review_findings",
+    "request_user_input",
 ]
 
 
@@ -59,4 +59,3 @@ ToolEventHandler = Callable[[ToolEvent], None]
 CoreActionEventHandler = Callable[[CoreActionEvent], None]
 RecoveryEventHandler = Callable[[RecoveryEvent], None]
 ModelRequestHandler = Callable[[], None]
-CommandApprovalHandler = Callable[[CommandApprovalRequest], bool]

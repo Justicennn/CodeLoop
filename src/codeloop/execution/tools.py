@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .command_policy import CommandApprovalRequest, dependency_mutation_request
+from .command_policy import (
+    CommandDescription,
+    describe_command,
+)
 from .document_sources import DocumentSourceError, extract_document
 from .source_text import SourceTextSliceError, bounded_text_slice
 from .visual_sources import (
@@ -30,6 +33,18 @@ from .workspace import Workspace, WorkspaceError
 
 ToolResult = dict[str, Any]
 ToolHandler = Callable[[dict[str, Any]], ToolResult]
+
+
+@dataclass(frozen=True)
+class CommandPreflight:
+    """One validated run_command description or its safe validation error."""
+
+    description: CommandDescription | None = None
+    error: ToolResult | None = None
+
+    def __post_init__(self) -> None:
+        if (self.description is None) == (self.error is None):
+            raise ValueError("CommandPreflight requires exactly one outcome")
 
 MAX_LIST_ITEMS = 200
 MAX_LIST_DEPTH = 8
@@ -556,6 +571,15 @@ RUN_COMMAND_SCHEMA: dict[str, Any] = {
                     "maximum": MAX_COMMAND_TIMEOUT_SECONDS,
                     "default": DEFAULT_COMMAND_TIMEOUT_SECONDS,
                 },
+                "authorization_basis": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": (
+                        "Exact text from the current task or a completed Human "
+                        "Interaction response that authorizes this exact action."
+                    ),
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -678,29 +702,43 @@ class ToolRegistry:
                     )
         return self._normalize_mutation_result(definition, result)
 
-    def command_approval_request(
+    def preflight_command(
         self,
         tool_name: str,
         arguments_json: str,
-    ) -> CommandApprovalRequest | None:
-        """Preflight one valid run_command without starting a subprocess."""
+    ) -> CommandPreflight | None:
+        """Describe one valid run_command without authorization or execution."""
         if tool_name != "run_command":
             return None
         try:
             arguments = json.loads(arguments_json)
             if not isinstance(arguments, dict):
-                return None
-            command, _cwd, _timeout = self._validated_run_command_arguments(
-                arguments
+                raise ToolInputError(
+                    "invalid_arguments",
+                    "Tool arguments must be a JSON object",
+                )
+            command, cwd, timeout = self._validated_run_command_arguments(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return CommandPreflight(
+                error=_error(
+                    "invalid_arguments",
+                    "Tool arguments must be a JSON object",
+                )
             )
-        except (
-            json.JSONDecodeError,
-            TypeError,
-            ToolInputError,
-            WorkspaceError,
-        ):
-            return None
-        return dependency_mutation_request(command)
+        except (ToolInputError, WorkspaceError) as exc:
+            return CommandPreflight(
+                error=_error(exc.error_code, exc.message, data=exc.data)
+            )
+        relative_cwd = cwd.relative_to(self._workspace.root).as_posix() or "."
+        return CommandPreflight(
+            description=describe_command(
+                command,
+                cwd=relative_cwd,
+                timeout_seconds=timeout,
+                display_command=tuple(self._redact(part) for part in command),
+                workspace_root=str(self._workspace.root),
+            )
+        )
 
     def confirmed_workspace_change(
         self,
@@ -1727,7 +1765,12 @@ class ToolRegistry:
     ) -> tuple[list[str], Path, int]:
         _validate_fields(
             arguments,
-            allowed={"command", "cwd", "timeout_seconds"},
+            allowed={
+                "command",
+                "cwd",
+                "timeout_seconds",
+                "authorization_basis",
+            },
             required={"command"},
         )
         command = arguments.get("command")
@@ -1749,6 +1792,17 @@ class ToolRegistry:
             minimum=1,
             maximum=MAX_COMMAND_TIMEOUT_SECONDS,
         )
+        if "authorization_basis" in arguments:
+            basis = _string_argument(
+                arguments,
+                "authorization_basis",
+                allow_empty=False,
+            )
+            if len(basis) > 1_000:
+                raise ToolInputError(
+                    "invalid_arguments",
+                    "authorization_basis must be at most 1000 characters",
+                )
         cwd = self._workspace.resolve(cwd_value, expected="directory")
         return list(command), cwd, timeout_seconds
 

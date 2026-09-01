@@ -2,7 +2,6 @@
 
 from .conversation import PublicConversationTurn
 from .events import (
-    CommandApprovalHandler,
     CoreActionName,
     CoreActionEvent,
     CoreActionEventHandler,
@@ -25,7 +24,6 @@ from .verification import VerificationAttempt, VerificationState, VerificationSt
 __all__ = [
     "AgentResult",
     "AgentRunner",
-    "CommandApprovalHandler",
     "CoreActionName",
     "CoreActionEvent",
     "CoreActionEventHandler",

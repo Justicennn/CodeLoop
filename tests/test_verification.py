@@ -29,11 +29,14 @@ SUCCESS = {
 def test_system_prompt_requires_minimum_sufficient_verification() -> None:
     prompt = SYSTEM_PROMPT
     assert "Minimum Sufficient Verification" in prompt
-    assert "验证深度必须与任务规模、风险和具体证据相称" in prompt
-    assert "不是必须逐项执行的清单" in prompt
-    assert "不得建立平行测试体系" in prompt
-    assert "不意味着必须新建测试" in prompt
-    assert "停止继续验证并进入完成" in prompt
+    assert "Tests are not a mandatory post-mutation step" in prompt
+    assert "UI 视觉优化" in prompt and "Presentation" in prompt
+    assert "用户没有明确要求测试时，默认不主动运行自动化测试" in prompt
+    assert "一个 test file" in prompt and "full suite" in prompt
+    assert "Human Control" in prompt and "APPROVE" in prompt
+    assert "INFORM" in prompt and "RE_APPROVE" in prompt
+    assert "没有运行自动化测试本身不阻止任务完成" in prompt
+    assert "实际执行和未执行的验证" in prompt
     assert "custom verification helper 失败本身不能证明" in prompt
     assert "Completion Review 本身不要求再增加验证层" in prompt
     assert "bug fix" in prompt and "test-and-repair loop" in prompt
@@ -79,6 +82,7 @@ def _registry_with_run_results(
     results: list[dict[str, Any]],
 ) -> ToolRegistry:
     registry = ToolRegistry(Workspace(tmp_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
     definition = registry._tools["run_command"]
     remaining = iter(results)
     registry._tools["run_command"] = ToolDefinition(
@@ -443,6 +447,7 @@ def test_run_command_filesystem_side_effect_is_not_managed(
     state = TaskState()
     monkeypatch.setattr(runner_module, "TaskState", lambda: state)
     registry = ToolRegistry(Workspace(tmp_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
     definition = registry._tools["run_command"]
 
     def command_with_unobserved_effect(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -473,9 +478,19 @@ def test_run_command_filesystem_side_effect_is_not_managed(
     assert result.last_verification.succeeded is True
 
 
-def test_completion_review_is_injected_once_then_cleared(
+@pytest.mark.parametrize(
+    "task,path,content",
+    [
+        ("Adjust the UI colors.", "style.css", "body { color: white; }"),
+        ("Update the documentation wording.", "README.md", "Updated text."),
+    ],
+)
+def test_low_risk_mutation_can_complete_without_verification_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    task: str,
+    path: str,
+    content: str,
 ) -> None:
     state = TaskState()
     monkeypatch.setattr(runner_module, "TaskState", lambda: state)
@@ -486,39 +501,52 @@ def test_completion_review_is_injected_once_then_cleared(
                     _tool_call(
                         "write",
                         "write_file",
-                        {"path": "value.txt", "content": "new"},
+                        {"path": path, "content": content},
                     )
                 ]
             ),
-            ModelResponse(text="first candidate"),
-            ModelResponse(text="accepted unverified final"),
+            ModelResponse(text="Completed without automated tests."),
         ]
     )
 
     result = AgentRunner(
         client,
         tools=ToolRegistry(Workspace(tmp_path)),
-    ).run("Create a file.")
+    ).run(task)
 
     assert result.status == "completed"
-    assert result.answer == "accepted unverified final"
-    assert result.steps == 3
+    assert result.answer == "Completed without automated tests."
+    assert result.steps == 2
     assert result.verification_status == "unverified"
     system_messages = [call["messages"][0]["content"] for call in client.calls]
-    assert "completion_review" not in system_messages[1]
-    assert "completion_review" in system_messages[2]
-    assert sum("completion_review" in content for content in system_messages) == 1
+    assert all("completion_review" not in message for message in system_messages)
+    assert result.last_verification is None
     assert state.pending_completion_review is None
-    assert state.last_completion_review_fingerprint is not None
+    assert state.last_completion_review_fingerprint is None
 
 
-def test_real_state_change_allows_a_new_completion_review(
+def test_active_plan_state_change_allows_a_new_completion_review(
     tmp_path: Path,
 ) -> None:
     client = FakeClient(
         [
             ModelResponse(
                 tool_calls=[
+                    _tool_call(
+                        "plan",
+                        UPDATE_PLAN_ACTION_NAME,
+                        {
+                            "mode": "create",
+                            "steps": [
+                                {
+                                    "id": "finish",
+                                    "description": "Finish both file changes",
+                                    "status": "in_progress",
+                                    "blocked_reason": None,
+                                }
+                            ],
+                        },
+                    ),
                     _tool_call(
                         "write-a",
                         "write_file",
@@ -554,7 +582,7 @@ def test_real_state_change_allows_a_new_completion_review(
     assert "completion_review" in system_messages[4]
 
 
-def test_active_plan_and_unverified_workspace_share_one_review(
+def test_active_plan_alone_triggers_one_completion_review(
     tmp_path: Path,
 ) -> None:
     plan_arguments = {
@@ -591,7 +619,8 @@ def test_active_plan_and_unverified_workspace_share_one_review(
     ).run("Build a project.")
 
     review_system = client.calls[2]["messages"][0]["content"]
-    assert '"reasons":["active_plan","unverified_workspace"]' in review_system
+    assert '"reasons":["active_plan"]' in review_system
+    assert "unverified_workspace" not in review_system
     assert result.status == "completed"
     assert result.plan_status == "active"
     assert [step.id for step in result.unfinished_steps] == ["build"]
@@ -603,6 +632,21 @@ def test_last_step_candidate_final_is_not_discarded(tmp_path: Path) -> None:
         [
             ModelResponse(
                 tool_calls=[
+                    _tool_call(
+                        "plan",
+                        UPDATE_PLAN_ACTION_NAME,
+                        {
+                            "mode": "create",
+                            "steps": [
+                                {
+                                    "id": "finish",
+                                    "description": "Finish the requested change",
+                                    "status": "in_progress",
+                                    "blocked_reason": None,
+                                }
+                            ],
+                        },
+                    ),
                     _tool_call(
                         "write",
                         "write_file",
@@ -641,6 +685,21 @@ def test_completion_review_request_is_stable_across_retry(
         [
             ModelResponse(
                 tool_calls=[
+                    _tool_call(
+                        "plan",
+                        UPDATE_PLAN_ACTION_NAME,
+                        {
+                            "mode": "create",
+                            "steps": [
+                                {
+                                    "id": "finish",
+                                    "description": "Finish the requested change",
+                                    "status": "in_progress",
+                                    "blocked_reason": None,
+                                }
+                            ],
+                        },
+                    ),
                     _tool_call(
                         "write",
                         "write_file",

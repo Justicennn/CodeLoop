@@ -455,9 +455,11 @@ def test_review_fix_invalidates_current_finding_then_reports_fixed(
         ]
     )
 
+    registry = ToolRegistry(Workspace(tmp_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
     result = AgentRunner(
         client,
-        tools=ToolRegistry(Workspace(tmp_path)),
+        tools=registry,
     ).run("Review and fix the most serious issue")
 
     assert result.status == "completed"

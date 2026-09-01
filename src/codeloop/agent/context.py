@@ -84,6 +84,23 @@ class ConversationContext:
         self._cycles.append(deepcopy([assistant_message, *tool_messages]))
         self._rebalance()
 
+    def add_interaction_cycle(
+        self,
+        assistant_message: Message,
+        response_message: Message,
+    ) -> None:
+        """Append one complete model-initiated Human Interaction cycle."""
+        self.add_tool_cycle(assistant_message, [response_message])
+
+    def add_public_note(self, content: str) -> None:
+        """Append a bounded post-tool-cycle public Human decision note."""
+        if not isinstance(content, str) or not content.strip():
+            return
+        self._cycles.append(
+            [{"role": "user", "content": content[:2_000]}]
+        )
+        self._rebalance()
+
     def messages_for_model(self) -> list[Message]:
         """Return a snapshot containing only pinned messages and complete cycles."""
         return deepcopy(self._compose_messages())

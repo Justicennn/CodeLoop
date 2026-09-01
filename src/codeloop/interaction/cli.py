@@ -26,8 +26,8 @@ from ..agent.context import (
 from ..execution.tools import ToolRegistry
 from ..execution.workspace import Workspace, WorkspaceError
 from ..model.client import OpenAICompatibleClient
-from .approval import ConsoleCommandApprover
 from .console import ConsoleRenderer
+from .console_interaction import NonInteractiveInteractionProvider
 from .narration import _NarratingModelClient
 from .session import InteractiveSession
 
@@ -39,6 +39,7 @@ EXIT_CODES: dict[TerminationReason, int] = {
     "runtime_error": 1,
     "fatal_api_error": 2,
     "user_interrupt": 130,
+    "interaction_required": 1,
 }
 
 
@@ -246,9 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if renderer is not None
                 else None
             ),
-            on_command_approval=(
-                ConsoleCommandApprover() if _stdin_is_interactive() else None
-            ),
+            interaction_provider=NonInteractiveInteractionProvider(),
             on_model_request_started=(
                 renderer.start_thinking if renderer is not None else None
             ),

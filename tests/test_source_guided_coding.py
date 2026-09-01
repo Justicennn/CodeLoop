@@ -518,6 +518,7 @@ def test_core_action_schema_retry_and_session_isolation(
         "update_working_set",
         "update_review_findings",
     ]
+    assert names[4] == "request_user_input"
     assert UPDATE_REQUIREMENTS_ACTION_NAME not in registry.names
     assert "read_document" in registry.names
     assert "read_webpage" in registry.names
@@ -631,7 +632,9 @@ def test_source_guided_fake_client_uses_existing_coding_loop(
         ]
     )
 
-    result = AgentRunner(client, tools=ToolRegistry(Workspace(tmp_path))).run(
+    registry = ToolRegistry(Workspace(tmp_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
+    result = AgentRunner(client, tools=registry).run(
         "Implement requirements.docx and verify it"
     )
 
@@ -737,6 +740,7 @@ def test_web_source_fake_client_uses_same_coding_loop(
         ]
     )
     registry = ToolRegistry(Workspace(tmp_path), webpage_adapter=Adapter())  # type: ignore[arg-type]
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
 
     result = AgentRunner(client, tools=registry).run(
         f"Implement the requirements at {requested} and verify them"

@@ -648,6 +648,7 @@ def test_progress_snapshot_is_stable_across_retry(
 
 def test_complex_task_completes_without_false_stall(tmp_path: Path) -> None:
     registry = ToolRegistry(Workspace(tmp_path))
+    registry.preflight_command = lambda *_args: None  # type: ignore[method-assign]
     run_definition = registry._tools["run_command"]
     run_results = iter(
         [
