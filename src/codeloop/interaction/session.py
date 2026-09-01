@@ -394,11 +394,20 @@ class InteractiveSession:
                 renderer.stop_thinking if renderer is not None else None
             ),
         )
-        result = runner.run(task, previous_turns=previous_turns)
-        if renderer is None or not _best_effort(renderer.show_result, result):
-            self._write_line(_fallback_result_text(result))
-        self._history.add(task, _public_assistant_text(result))
-        return result
+        try:
+            result = runner.run(task, previous_turns=previous_turns)
+            if renderer is None or not _best_effort(renderer.show_result, result):
+                self._write_line(_fallback_result_text(result))
+            self._history.add(task, _public_assistant_text(result))
+            return result
+        finally:
+            callback = (
+                getattr(renderer, "close", None)
+                if renderer is not None
+                else None
+            )
+            if callback is not None:
+                _best_effort(callback)
 
     def _show_plain_narration(self, text: str) -> None:
         narration = text.strip()
@@ -542,7 +551,7 @@ def _is_redundant_codeloop_invocation(value: str) -> bool:
 
 def _new_renderer() -> ConsoleRenderer | None:
     try:
-        return ConsoleRenderer()
+        return ConsoleRenderer(live=True)
     except Exception:
         return None
 

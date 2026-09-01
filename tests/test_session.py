@@ -320,6 +320,9 @@ def test_each_task_gets_a_fresh_renderer_and_empty_input_is_ignored(
     renderers: list[object] = []
 
     class Renderer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
         def start_thinking(self) -> None:
             pass
 
@@ -331,6 +334,9 @@ def test_each_task_gets_a_fresh_renderer_and_empty_input_is_ignored(
 
         def show_result(self, _result: object) -> None:
             pass
+
+        def close(self) -> None:
+            self.close_calls += 1
 
     def factory():
         renderer = Renderer()
@@ -348,6 +354,7 @@ def test_each_task_gets_a_fresh_renderer_and_empty_input_is_ignored(
     assert session.run() == 0
     assert len(renderers) == 2
     assert renderers[0] is not renderers[1]
+    assert all(renderer.close_calls == 1 for renderer in renderers)
 
 
 @pytest.mark.parametrize("reset_input", ["/new", "workspace"])

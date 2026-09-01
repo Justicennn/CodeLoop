@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console, Group
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.panel import Panel
@@ -17,11 +18,20 @@ from rich.syntax import SyntaxTheme
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
+from rich.tree import Tree
 
 from codeloop.agent.events import CoreActionEvent, RecoveryEvent, ToolEvent
+from codeloop.agent.plan import PlanStep
 from codeloop.agent.runner import AgentResult
 
-from .presentation import PresentationBlock, PresentationLine, PresentationState
+from .presentation import (
+    PresentationAction,
+    PresentationBlock,
+    PresentationLine,
+    PresentationSnapshot,
+    PresentationState,
+    PresentationUpdate,
+)
 
 
 FAILURE_OUTPUT_LIMIT = 1_000
@@ -67,10 +77,20 @@ _BACKGROUND_FREE_MARKDOWN_STYLES = {
 
 
 class ConsoleRenderer:
-    def __init__(self, console: Console | None = None) -> None:
+    def __init__(
+        self,
+        console: Console | None = None,
+        *,
+        live: bool = False,
+    ) -> None:
         self.console = console or Console()
         self._thinking: Status | None = None
         self._presentation = PresentationState()
+        self._live_capable = live and self.console.is_terminal
+        self._live: Live | None = None
+        self._live_disabled = False
+        self._live_failed = False
+        self._used_live = False
 
     def show_header(self, model: str, workspace: Path, task: str) -> None:
         title = Text("CodeLoop", style="bold cyan")
@@ -103,6 +123,7 @@ class ConsoleRenderer:
             Text(""),
             metadata,
         )
+        banner_width = min(self.console.width, 104)
         self.console.print(
             Panel(
                 Padding(content, (0, 1)),
@@ -110,7 +131,8 @@ class ConsoleRenderer:
                 title_align="left",
                 border_style=_ACCENT_STYLE,
                 padding=(1, 1),
-                expand=True,
+                width=banner_width,
+                expand=False,
             )
         )
         self.console.print()
@@ -132,6 +154,9 @@ class ConsoleRenderer:
         self.console.print(Text("Bye.", style=_MUTED_STYLE))
 
     def start_thinking(self) -> None:
+        if self._live_capable and not self._live_disabled:
+            if self._ensure_live():
+                return
         if self._thinking is None:
             self._thinking = self.console.status(
                 "[cyan]Working...[/cyan]", spinner="dots"
@@ -139,9 +164,29 @@ class ConsoleRenderer:
             self._thinking.start()
 
     def stop_thinking(self) -> None:
-        if self._thinking is not None:
-            self._thinking.stop()
-            self._thinking = None
+        if self._live is not None:
+            return
+        self._stop_status()
+
+    def close(self) -> None:
+        """Idempotently stop every transient Presentation primitive."""
+        self._stop_status()
+        live = self._live
+        self._live = None
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                self._live_failed = True
+
+    def _stop_status(self) -> None:
+        thinking = self._thinking
+        self._thinking = None
+        if thinking is not None:
+            try:
+                thinking.stop()
+            except Exception:
+                pass
 
     def show_narration(self, narration: str) -> None:
         """Render model-provided public narration without inferring intent."""
@@ -149,6 +194,17 @@ class ConsoleRenderer:
         text = _compact_answer_spacing(narration)
         if not text:
             return
+        try:
+            update = self._presentation.observe_narration(text)
+        except Exception:
+            self._disable_live()
+            self._render_linear_narration(text)
+            return
+        if self._present_live(update):
+            return
+        self._render_linear_narration(update.linear_narration or text)
+
+    def _render_linear_narration(self, text: str) -> None:
         with self.console.use_theme(
             Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
         ):
@@ -159,8 +215,21 @@ class ConsoleRenderer:
 
     def show_tool_event(self, event: ToolEvent) -> None:
         self.stop_thinking()
-        self._presentation.record_managed_change(event)
-        section = self._presentation.section_for_tool(event)
+        try:
+            update = self._presentation.observe_tool(event)
+        except Exception:
+            self._disable_live()
+            self._render_linear_tool(event, _fallback_tool_section(event))
+            return
+        if self._present_live(update):
+            return
+        self._render_linear_tool(event, update.linear_tool_section)
+
+    def _render_linear_tool(
+        self,
+        event: ToolEvent,
+        section: str | None,
+    ) -> None:
         if section is None:
             return
         self._render_section(section)
@@ -191,16 +260,65 @@ class ConsoleRenderer:
 
     def show_core_action_event(self, event: CoreActionEvent) -> None:
         self.stop_thinking()
-        block = self._presentation.record_core_action(event)
-        if block is not None:
+        try:
+            update = self._presentation.observe_core_action(event)
+        except Exception:
+            self._disable_live()
+            self._render_core_failure_fallback(event)
+            return
+        if self._present_live(update):
+            return
+        for block in update.linear_blocks:
             self._render_block(block)
 
     def show_recovery_event(self, event: RecoveryEvent) -> None:
         self.stop_thinking()
-        self._render_block(self._presentation.record_recovery(event))
+        try:
+            update = self._presentation.observe_recovery(event)
+        except Exception:
+            self._disable_live()
+            self._render_heading(
+                "⚠",
+                "Recovery requested after no material progress",
+                _WARNING_STYLE,
+            )
+            return
+        if self._present_live(update):
+            return
+        for block in update.linear_blocks:
+            self._render_block(block)
 
     def show_result(self, result: AgentResult) -> None:
-        self.stop_thinking()
+        live_was_clean = self._used_live and not self._live_failed
+        self.close()
+        if live_was_clean and not self._live_failed:
+            self._render_live_result(result)
+            return
+        self._render_linear_result(result)
+
+    def _render_live_result(self, result: AgentResult) -> None:
+        if result.status != "completed":
+            line = Text("✗ ", style=f"bold {_ERROR_STYLE}")
+            line.append(f"Stopped · {result.status}")
+            self.console.print(line)
+            if result.message:
+                self.console.print(Text(result.message))
+            self.console.print()
+            return
+        answer = result.answer or ""
+        if not answer.strip():
+            self._render_heading("✓", "Done", _SUCCESS_STYLE)
+            self.console.print()
+            return
+        with self.console.use_theme(
+            Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
+        ):
+            self.console.print(
+                Markdown(answer, code_theme=_TERMINAL_NATIVE_SYNTAX_THEME)
+            )
+        self.console.print()
+
+    def _render_linear_result(self, result: AgentResult) -> None:
         changed = self._presentation.changed_block()
         if changed is not None:
             self._render_block(changed)
@@ -262,6 +380,161 @@ class ConsoleRenderer:
                         )
                     )
         self.console.print()
+
+    def _ensure_live(self) -> bool:
+        if not self._live_capable or self._live_disabled:
+            return False
+        if self._live is not None:
+            return True
+        try:
+            initial = self._build_live_renderable(
+                self._presentation.snapshot(),
+                initial=True,
+            )
+            live = Live(
+                initial,
+                console=self.console,
+                transient=True,
+                auto_refresh=False,
+            )
+            self._live = live
+            self._used_live = True
+            live.start(refresh=False)
+            live.refresh()
+            return True
+        except Exception:
+            self._disable_live()
+            return False
+
+    def _present_live(self, update: PresentationUpdate) -> bool:
+        if not self._live_capable or self._live_disabled:
+            return False
+        if not self._ensure_live():
+            return False
+        live = self._live
+        if live is None:
+            return False
+        try:
+            renderable = self._build_live_renderable(update.snapshot)
+            live.update(renderable, refresh=False)
+            live.refresh()
+            return True
+        except Exception:
+            self._disable_live()
+            return False
+
+    def _disable_live(self) -> None:
+        self._live_disabled = True
+        self._live_failed = self._used_live or self._live_capable
+        live = self._live
+        self._live = None
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+
+    def _build_live_renderable(
+        self,
+        snapshot: PresentationSnapshot,
+        *,
+        initial: bool = False,
+    ) -> Group:
+        phase = snapshot.phase or "Understanding"
+        root_label = Text("● ", style=f"bold {_ACCENT_STYLE}")
+        root_label.append(phase, style=f"bold {_ACCENT_STYLE}")
+        tree = Tree(root_label, guide_style=_MUTED_STYLE)
+
+        if snapshot.plan_steps:
+            for step in snapshot.plan_steps:
+                tree.add(_plan_step_text(step))
+            if snapshot.hidden_plan_steps:
+                tree.add(
+                    Text(
+                        f"… {snapshot.hidden_plan_steps} more plan steps",
+                        style=_MUTED_STYLE,
+                    )
+                )
+
+        action_parent = tree
+        if snapshot.plan_steps and snapshot.actions:
+            action_parent = tree.add(Text("Evidence", style=_MUTED_STYLE))
+        self._append_live_actions(action_parent, snapshot.actions)
+        if snapshot.hidden_actions:
+            action_parent.add(
+                Text(
+                    f"… {snapshot.hidden_actions} earlier actions",
+                    style=_MUTED_STYLE,
+                )
+            )
+
+        facts = Table.grid(padding=(0, 2), expand=False)
+        facts.add_column(style=_MUTED_STYLE, no_wrap=True)
+        facts.add_column(overflow="fold")
+        for index, finding in enumerate(snapshot.findings):
+            label = "发现" if index == 0 else ""
+            finding_text = Text()
+            finding_text.append(f"{finding.priority.upper()} · ", style=_MUTED_STYLE)
+            finding_text.append(finding.title)
+            facts.add_row(label, finding_text)
+        if snapshot.hidden_findings:
+            facts.add_row("", Text(f"… {snapshot.hidden_findings} more", style=_MUTED_STYLE))
+
+        current = snapshot.current
+        if initial and current is None:
+            current = "正在理解任务和已有上下文"
+        if current:
+            facts.add_row("当前", Text(current, style=_MUTED_STYLE))
+        if snapshot.next_step:
+            facts.add_row("下一步", Text(snapshot.next_step, style=_MUTED_STYLE))
+
+        if facts.row_count:
+            return Group(tree, Text(""), facts)
+        return Group(tree)
+
+    def _append_live_actions(
+        self,
+        parent: Tree,
+        actions: tuple[PresentationAction, ...],
+    ) -> None:
+        grouped_reads = [action for action in actions if action.label == "Read file"]
+        emitted_read_group = False
+        for action in actions:
+            if action.label == "Read file" and len(grouped_reads) > 1:
+                if emitted_read_group:
+                    continue
+                emitted_read_group = True
+                status = (
+                    "failure"
+                    if any(item.status == "failure" for item in grouped_reads)
+                    else "success"
+                )
+                branch = parent.add(_action_text("Read files", status, None, 1))
+                for item in grouped_reads:
+                    child = branch.add(
+                        _action_text("", item.status, item.target, item.count)
+                    )
+                    for detail in item.details:
+                        child.add(Text(detail, style=_MUTED_STYLE))
+                continue
+            node = parent.add(
+                _action_text(
+                    action.label,
+                    action.status,
+                    action.target,
+                    action.count,
+                )
+            )
+            for detail in action.details:
+                node.add(Text(detail, style=_MUTED_STYLE))
+
+    def _render_core_failure_fallback(self, event: CoreActionEvent) -> None:
+        marker = "✓" if event.result.get("ok") is True else "✗"
+        color = _SUCCESS_STYLE if event.result.get("ok") is True else _ERROR_STYLE
+        self._render_heading(marker, event.name, color)
+        message = event.result.get("message")
+        if isinstance(message, str) and message:
+            self.console.print(Text(f"  {message}", style=color))
 
     def _render_block(self, block: PresentationBlock) -> None:
         self._render_section(block.section)
@@ -403,6 +676,62 @@ class ConsoleRenderer:
             self.console.print(Text(f"  {line}", style=style))
         if truncated and TRUNCATION_MARKER not in text:
             self.console.print(Text(f"  {TRUNCATION_MARKER}", style="dim"))
+
+
+def _plan_step_text(step: PlanStep) -> Text:
+    marker, style = {
+        "completed": ("✓", _SUCCESS_STYLE),
+        "in_progress": ("●", _ACCENT_STYLE),
+        "pending": ("○", _MUTED_STYLE),
+        "blocked": ("⚠", _WARNING_STYLE),
+    }[step.status]
+    line = Text(f"{marker} ", style=f"bold {style}")
+    line.append(step.description, style=style if step.status != "completed" else None)
+    if step.status == "blocked" and step.blocked_reason:
+        line.append(f" · {step.blocked_reason}", style=_MUTED_STYLE)
+    return line
+
+
+def _action_text(
+    label: str,
+    status: str,
+    target: str | None,
+    count: int,
+) -> Text:
+    marker, style = {
+        "success": ("✓", _SUCCESS_STYLE),
+        "failure": ("✗", _ERROR_STYLE),
+        "warning": ("⚠", _WARNING_STYLE),
+    }.get(status, ("✗", _ERROR_STYLE))
+    line = Text(f"{marker} ", style=f"bold {style}")
+    if label:
+        line.append(label)
+    if target:
+        if label:
+            line.append(" · ", style=_MUTED_STYLE)
+        line.append(target, style=_MUTED_STYLE)
+    if count > 1:
+        line.append(f" · {count}x", style=_MUTED_STYLE)
+    return line
+
+
+def _fallback_tool_section(event: ToolEvent) -> str | None:
+    name = event.tool_call.name
+    if event.result.get("ok") is True and name in _READ_ONLY_TOOLS:
+        return None
+    if name == "run_command":
+        if event.result.get("error_code") in {
+            "user_denied",
+            "approval_unavailable",
+        }:
+            return "WORKING"
+        return "VERIFICATION"
+    if (
+        event.result.get("ok") is not True
+        and name in {"read_document", "read_webpage", "read_image"}
+    ):
+        return "UNDERSTANDING"
+    return "WORKING"
 
 
 def _object_arguments(raw_arguments: str) -> dict[str, Any]:

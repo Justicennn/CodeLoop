@@ -16,6 +16,7 @@ from rich.console import Console
 
 import codeloop.agent.runner as agent_module
 import codeloop.execution.tools as tools_module
+import codeloop.interaction.console as console_module
 from codeloop.agent.context import ConversationContext
 from codeloop.agent.events import (
     CoreActionEvent,
@@ -1233,6 +1234,193 @@ def test_compact_result_uses_real_verification_and_termination_status() -> None:
     assert "Done" not in stopped
 
 
+def test_live_presentation_is_transient_event_driven_and_final_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle: list[str] = []
+
+    class FakeLive:
+        instances: list["FakeLive"] = []
+
+        def __init__(
+            self,
+            renderable: object,
+            *,
+            console: Console,
+            transient: bool,
+            auto_refresh: bool,
+        ) -> None:
+            del console
+            self.renderable = renderable
+            self.transient = transient
+            self.auto_refresh = auto_refresh
+            self.updates = 0
+            self.refreshes = 0
+            self.stops = 0
+            self.instances.append(self)
+
+        def start(self, *, refresh: bool) -> None:
+            assert refresh is False
+            lifecycle.append("start")
+
+        def update(self, renderable: object, *, refresh: bool) -> None:
+            assert refresh is False
+            self.renderable = renderable
+            self.updates += 1
+            lifecycle.append("update")
+
+        def refresh(self) -> None:
+            self.refreshes += 1
+            lifecycle.append("refresh")
+
+        def stop(self) -> None:
+            self.stops += 1
+            lifecycle.append("stop")
+
+    monkeypatch.setattr(console_module, "Live", FakeLive)
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=True,
+            width=100,
+        ),
+        live=True,
+    )
+
+    renderer.start_thinking()
+    live = FakeLive.instances[0]
+    assert live.transient is True
+    assert live.auto_refresh is False
+    assert live.refreshes == 1
+    assert renderer._presentation.snapshot().phase is None
+
+    renderer.show_narration("我先检查当前项目。")
+    narration_snapshot = renderer._presentation.snapshot()
+    assert narration_snapshot.phase is None
+    assert narration_snapshot.current == "我先检查当前项目。"
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall("read", "read_file", '{"path":"app.py"}'),
+            result={"ok": True, "data": {"path": "app.py"}},
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    snapshot = renderer._presentation.snapshot()
+    assert snapshot.phase == "Inspecting workspace"
+    assert snapshot.current is None
+    assert len(snapshot.actions) == 1
+    assert snapshot.actions[0].target == "app.py"
+    assert live.updates == 2
+    assert live.refreshes == 3
+    renderer.start_thinking()
+    assert renderer._presentation.snapshot().phase == "Inspecting workspace"
+    assert live.updates == 2
+    assert live.refreshes == 3
+
+    renderer.show_result(
+        AgentResult(status="completed", answer="FINAL_ONLY", steps=2)
+    )
+    output = rendered.getvalue()
+    assert live.stops == 1
+    assert lifecycle.index("stop") < len(lifecycle)
+    assert output.count("FINAL_ONLY") == 1
+    assert "DONE" not in output
+    assert "Task completed" not in output
+    assert "app.py" not in output
+    renderer.close()
+    assert live.stops == 1
+
+    stopped_output = StringIO()
+    stopped_renderer = ConsoleRenderer(
+        console=Console(
+            file=stopped_output,
+            color_system=None,
+            force_terminal=True,
+            width=100,
+        ),
+        live=True,
+    )
+    stopped_renderer.start_thinking()
+    stopped_live = FakeLive.instances[1]
+    stopped_renderer.show_result(
+        AgentResult(
+            status="no_progress",
+            answer=None,
+            steps=3,
+            message="No material progress was detected.",
+        )
+    )
+    stopped_text = stopped_output.getvalue()
+    assert stopped_live.stops == 1
+    assert "Stopped · no_progress" in stopped_text
+    assert "No material progress was detected." in stopped_text
+    assert "STOPPED" not in stopped_text
+
+
+def test_live_failure_falls_back_without_reconsuming_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingLive:
+        def __init__(self, renderable: object, **_kwargs: object) -> None:
+            del renderable
+            self.stops = 0
+
+        def start(self, *, refresh: bool) -> None:
+            assert refresh is False
+
+        def update(self, renderable: object, *, refresh: bool) -> None:
+            del renderable, refresh
+            raise RuntimeError("render failed")
+
+        def refresh(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stops += 1
+
+    monkeypatch.setattr(console_module, "Live", FailingLive)
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=True,
+            width=100,
+        ),
+        live=True,
+    )
+    renderer.start_thinking()
+    renderer.show_tool_event(
+        ToolEvent(
+            tool_call=ToolCall("edit", "edit_file", '{"path":"app.py"}'),
+            result={
+                "ok": True,
+                "data": {
+                    "path": "app.py",
+                    "workspace_changed": True,
+                    "replacements": 1,
+                },
+            },
+            dispatch_duration_ms=1,
+            truncated=False,
+        )
+    )
+    snapshot = renderer._presentation.snapshot()
+    assert len(snapshot.actions) == 1
+    assert snapshot.actions[0].count == 1
+    assert rendered.getvalue().count("Updated app.py") == 1
+
+    renderer.show_result(
+        AgentResult(status="completed", answer="fallback final", steps=2)
+    )
+    output = rendered.getvalue()
+    assert "DONE" in output
+    assert output.count("fallback final") == 1
+
+
 def test_structured_sections_render_only_explicit_runtime_facts() -> None:
     rendered = StringIO()
     renderer = ConsoleRenderer(
@@ -1241,7 +1429,8 @@ def test_structured_sections_render_only_explicit_runtime_facts() -> None:
             color_system=None,
             force_terminal=False,
             width=80,
-        )
+        ),
+        live=True,
     )
     renderer.show_core_action_event(
         CoreActionEvent(
