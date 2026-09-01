@@ -12,7 +12,9 @@ from shutil import copytree
 from typing import Any
 
 import pytest
-from rich.console import Console
+from rich.cells import cell_len
+from rich.console import Console, ConsoleOptions
+from rich.text import Text
 
 import codeloop.agent.runner as agent_module
 import codeloop.execution.tools as tools_module
@@ -41,6 +43,7 @@ from codeloop.interaction.console import (
     ConsoleRenderer,
     _CODELOOP_MARKDOWN_STYLES,
     _bounded_text,
+    _cjk_aware_wrap,
     _get_content_width,
     _get_horizontal_margin,
     _get_layout_widths,
@@ -1262,6 +1265,126 @@ def test_responsive_presentation_widths_share_pure_bounded_geometry() -> None:
     assert layout.viewport == 139
     assert layout.reading == _get_content_width(layout.viewport)
     assert layout.left + layout.reading + layout.right == layout.viewport
+
+
+def test_final_markdown_uses_current_safe_viewport_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_widths: list[int] = []
+
+    class WidthProbe:
+        def __rich_console__(
+            self,
+            _console: Console,
+            options: ConsoleOptions,
+        ):
+            captured_widths.append(options.max_width)
+            yield Text("Final width probe")
+
+    monkeypatch.setattr(
+        console_module,
+        "_CodeLoopFinalMarkdown",
+        lambda *_args, **_kwargs: WidthProbe(),
+    )
+    console = Console(
+        file=StringIO(),
+        color_system=None,
+        force_terminal=True,
+        width=170,
+    )
+    ConsoleRenderer(console=console)._render_final_markdown(
+        "这是一个集合型工作区，包含 4 个相互独立的示例工程 + 1 份架构设计文档。"
+    )
+
+    layout = _get_layout_widths(console.width)
+    assert console.width == 170
+    assert layout.viewport == 169
+    assert layout.reading < layout.viewport
+    assert captured_widths == [layout.viewport]
+
+
+def test_final_cjk_wrapper_uses_remaining_cells_before_breaking() -> None:
+    lines = _cjk_aware_wrap("前缀 UI 交互测试，可以继续。", 14)
+
+    assert lines[0].plain == "前缀 UI 交互测"
+    assert all(cell_len(line.plain) <= 14 for line in lines)
+
+
+def test_final_cjk_wrapper_keeps_normal_latin_tokens_intact() -> None:
+    lines = _cjk_aware_wrap("中文 workspace 验证", 10)
+
+    assert [line.plain for line in lines] == ["中文", "workspace", "验证"]
+    assert all(cell_len(line.plain) <= 10 for line in lines)
+
+
+def test_final_cjk_wrapper_folds_only_an_overlong_latin_token() -> None:
+    lines = _cjk_aware_wrap("verification", 5)
+
+    assert [line.plain for line in lines] == ["verif", "icati", "on"]
+    assert all(cell_len(line.plain) <= 5 for line in lines)
+
+
+def test_final_cjk_wrapper_preserves_rich_text_styles() -> None:
+    console = Console(color_system=None)
+    source = Text("中文 coding 测试")
+    source.stylize("bold", 3, 9)
+
+    lines = _cjk_aware_wrap(source, 8)
+    coding = next(line for line in lines if line.plain == "coding")
+
+    assert coding.get_style_at_offset(console, 0).bold is True
+    assert coding.get_style_at_offset(console, 5).bold is True
+
+
+def test_final_list_paragraph_uses_parent_reduced_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_widths: list[int] = []
+    original_wrap = console_module._cjk_aware_wrap
+
+    def observe_width(text: Text | str, width: int) -> list[Text]:
+        observed_widths.append(width)
+        return original_wrap(text, width)
+
+    monkeypatch.setattr(console_module, "_cjk_aware_wrap", observe_width)
+    rendered = StringIO()
+    console = Console(
+        file=rendered,
+        color_system=None,
+        force_terminal=True,
+        width=40,
+    )
+
+    ConsoleRenderer(console=console)._render_final_markdown(
+        "- 如果你想补充 UI 交互测试，可以告诉我相关文件。"
+    )
+
+    viewport = _get_safe_terminal_width(console.width)
+    assert observed_widths
+    assert all(width < viewport for width in observed_widths)
+    assert "•" in rendered.getvalue()
+
+
+def test_non_final_markdown_does_not_use_final_cjk_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(_text: Text | str, _width: int) -> list[Text]:
+        raise AssertionError("Final-only wrapper was used by narration Markdown")
+
+    monkeypatch.setattr(console_module, "_cjk_aware_wrap", fail_if_called)
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=80,
+        )
+    )
+
+    renderer._render_markdown("普通 narration 保持现有 Markdown 路径。")
+
+    assert "普通 narration" in rendered.getvalue()
 
 
 def test_final_markdown_headings_use_focused_brand_style() -> None:

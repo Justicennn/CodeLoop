@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.control import Control
 from rich.live import Live
@@ -125,11 +126,213 @@ class _CodeLoopParagraph(Paragraph):
         yield text
 
 
+_CJK_OPENING_PUNCTUATION = frozenset("([{（［｛《〈「『【〔〖〘〚‘“")
+_CJK_CLOSING_PUNCTUATION = frozenset(
+    ")]},.!?;:）］｝，。！？；：、》〉」』】〕〗〙〛’”…"
+)
+
+
+def _is_cjk_character(character: str) -> bool:
+    """Return whether a character is in a common CJK writing block."""
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def _cjk_wrap_tokens(plain: str) -> list[tuple[str, int, int]]:
+    """Split prose into whitespace, CJK, punctuation, and word tokens."""
+    tokens: list[tuple[str, int, int]] = []
+    offset = 0
+    text_length = len(plain)
+    while offset < text_length:
+        start = offset
+        character = plain[offset]
+        if character.isspace():
+            offset += 1
+            while offset < text_length and plain[offset].isspace():
+                offset += 1
+            tokens.append(("space", start, offset))
+            continue
+        if character in _CJK_OPENING_PUNCTUATION:
+            tokens.append(("open", start, start + 1))
+            offset += 1
+            continue
+        if character in _CJK_CLOSING_PUNCTUATION:
+            tokens.append(("close", start, start + 1))
+            offset += 1
+            continue
+        if _is_cjk_character(character):
+            tokens.append(("cjk", start, start + 1))
+            offset += 1
+            continue
+        offset += 1
+        while offset < text_length:
+            following = plain[offset]
+            if (
+                following.isspace()
+                or following in _CJK_OPENING_PUNCTUATION
+                or following in _CJK_CLOSING_PUNCTUATION
+                or _is_cjk_character(following)
+            ):
+                break
+            offset += 1
+        tokens.append(("word", start, offset))
+
+    # Keep closing punctuation with the preceding token and opening punctuation
+    # with the following token. This is intentionally a small typography rule,
+    # not a second Unicode line-breaking implementation.
+    joined: list[tuple[str, int, int]] = []
+    for kind, start, end in tokens:
+        if kind == "close" and joined and joined[-1][0] != "space":
+            previous_kind, previous_start, _ = joined[-1]
+            joined[-1] = (previous_kind, previous_start, end)
+            continue
+        if joined and joined[-1][0] == "open" and kind != "space":
+            _, previous_start, _ = joined[-1]
+            joined[-1] = (kind, previous_start, end)
+            continue
+        joined.append((kind, start, end))
+    return joined
+
+
+def _fold_styled_token(
+    text: Text,
+    start: int,
+    end: int,
+    width: int,
+) -> list[Text]:
+    """Fold one overlong token by terminal cells while preserving Text spans."""
+    chunks: list[Text] = []
+    chunk_start = start
+    chunk_width = 0
+    offset = start
+    while offset < end:
+        character_width = cell_len(text.plain[offset])
+        if chunk_width and chunk_width + character_width > width:
+            chunks.append(text[chunk_start:offset])
+            chunk_start = offset
+            chunk_width = 0
+        chunk_width += character_width
+        offset += 1
+        if chunk_width >= width:
+            chunks.append(text[chunk_start:offset])
+            chunk_start = offset
+            chunk_width = 0
+    if chunk_start < end:
+        chunks.append(text[chunk_start:end])
+    return chunks
+
+
+def _cjk_aware_wrap(text: Text | str, width: int) -> list[Text]:
+    """Wrap Final prose at CJK boundaries using terminal cell width.
+
+    Rich ``Text`` slices and appends preserve Markdown style spans. Existing
+    newlines remain logical line boundaries; this helper only chooses visual
+    breaks inside each logical line.
+    """
+    source = text.copy() if isinstance(text, Text) else Text(text)
+    available_width = max(1, width)
+    wrapped_lines: list[Text] = []
+
+    for logical_line in source.split(allow_blank=True):
+        tokens = _cjk_wrap_tokens(logical_line.plain)
+        current = logical_line.blank_copy("")
+        current.end = ""
+        current_width = 0
+        pending_space: tuple[int, int] | None = None
+
+        for kind, start, end in tokens:
+            if kind == "space":
+                if current.plain:
+                    pending_space = (start, end)
+                continue
+
+            token_width = cell_len(logical_line.plain[start:end])
+            space_width = (
+                cell_len(
+                    logical_line.plain[pending_space[0] : pending_space[1]]
+                )
+                if pending_space is not None
+                else 0
+            )
+            if (
+                current.plain
+                and current_width + space_width + token_width > available_width
+            ):
+                wrapped_lines.append(current)
+                current = logical_line.blank_copy("")
+                current.end = ""
+                current_width = 0
+                pending_space = None
+
+            if token_width > available_width:
+                chunks = _fold_styled_token(
+                    logical_line,
+                    start,
+                    end,
+                    available_width,
+                )
+                for index, chunk in enumerate(chunks):
+                    if current.plain:
+                        wrapped_lines.append(current)
+                        current = logical_line.blank_copy("")
+                        current.end = ""
+                    current.append(chunk)
+                    current_width = cell_len(chunk.plain)
+                    if index < len(chunks) - 1:
+                        wrapped_lines.append(current)
+                        current = logical_line.blank_copy("")
+                        current.end = ""
+                        current_width = 0
+                pending_space = None
+                continue
+
+            if pending_space is not None and current.plain:
+                current.append(logical_line[pending_space[0] : pending_space[1]])
+                current_width += space_width
+            current.append(logical_line[start:end])
+            current_width += token_width
+            pending_space = None
+
+        if current.plain or not tokens:
+            wrapped_lines.append(current)
+
+    return wrapped_lines
+
+
+class _CodeLoopFinalParagraph(Paragraph):
+    """Use Final-only CJK-aware wrapping at the actual container width."""
+
+    def __rich_console__(self, console: Console, options: Any):
+        del console
+        lines = _cjk_aware_wrap(self.text, max(1, options.max_width))
+        wrapped = Text("\n").join(lines)
+        wrapped.justify = "left"
+        wrapped.no_wrap = True
+        wrapped.overflow = "ignore"
+        yield wrapped
+
+
 class _CodeLoopMarkdown(Markdown):
     elements = {
         **Markdown.elements,
         "heading_open": _CodeLoopHeading,
         "paragraph_open": _CodeLoopParagraph,
+    }
+
+
+class _CodeLoopFinalMarkdown(_CodeLoopMarkdown):
+    """Final Markdown variant with CJK-aware prose wrapping only."""
+
+    elements = {
+        **_CodeLoopMarkdown.elements,
+        "paragraph_open": _CodeLoopFinalParagraph,
     }
 
 
@@ -375,18 +578,6 @@ class ConsoleRenderer:
     def _print_viewport(self, renderable: Any) -> None:
         """Print once against the current safe terminal viewport."""
         self.console.print(renderable, width=self._layout_widths().viewport)
-
-    def _print_reading(self, renderable: Any) -> None:
-        """Print long-form content in the current responsive reading column."""
-        layout = self._layout_widths()
-        self.console.print(
-            Padding(
-                renderable,
-                (0, layout.right, 0, layout.left),
-                expand=True,
-            ),
-            width=layout.viewport,
-        )
 
     def _measure_input_lines(self, text: str, width: int) -> int:
         options = self.console.options.update(width=max(1, width))
@@ -715,24 +906,19 @@ class ConsoleRenderer:
         self._render_linear_narration(update.linear_narration or text)
 
     def _render_linear_narration(self, text: str) -> None:
-        self._render_markdown(text, responsive=False)
+        self._render_markdown(text)
         self.console.print()
 
-    def _render_markdown(self, text: str, *, responsive: bool) -> None:
+    def _render_markdown(self, text: str, *, final: bool = False) -> None:
         source = _compact_answer_spacing(text)
-        markdown = _CodeLoopMarkdown(
+        markdown_type = _CodeLoopFinalMarkdown if final else _CodeLoopMarkdown
+        markdown = markdown_type(
             source,
             code_theme=_TERMINAL_NATIVE_SYNTAX_THEME,
         )
         with self.console.use_theme(
             Theme(_CODELOOP_MARKDOWN_STYLES), inherit=True
         ):
-            if responsive and self.console.is_terminal:
-                # The outer reading column owns the width. Markdown children
-                # receive one shared remaining ConsoleOptions.max_width and
-                # Rich handles mixed CJK, Latin, emoji, and inline code cells.
-                self._print_reading(markdown)
-                return
             if self.console.is_terminal:
                 self._print_viewport(markdown)
                 return
@@ -741,7 +927,7 @@ class ConsoleRenderer:
     def _render_final_markdown(self, text: str) -> None:
         """Normalize model soft breaks only for public Final Markdown."""
         source = _normalize_final_markdown_soft_breaks(text)
-        self._render_markdown(source, responsive=True)
+        self._render_markdown(source, final=True)
 
     def show_tool_event(self, event: ToolEvent) -> None:
         self._note_presentation_output()
