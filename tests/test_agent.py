@@ -39,7 +39,11 @@ from codeloop.interaction.console import (
     OUTPUT_TRUNCATION_MARKER,
     SUCCESS_EVIDENCE_CHARS,
     ConsoleRenderer,
+    _CODELOOP_MARKDOWN_STYLES,
     _bounded_text,
+    _get_content_width,
+    _get_horizontal_margin,
+    _get_safe_terminal_width,
 )
 from codeloop.model.client import ModelAPIError, ModelResponse, ToolCall
 
@@ -1232,6 +1236,103 @@ def test_compact_result_uses_real_verification_and_termination_status() -> None:
     assert "✗ no_progress" in stopped
     assert "No material progress was detected." in stopped
     assert "Done" not in stopped
+
+
+def test_responsive_presentation_widths_share_pure_bounded_geometry() -> None:
+    assert _get_safe_terminal_width(1) == 1
+    assert _get_safe_terminal_width(80) == 79
+
+    safe_widths = (79, 139, 399)
+    content_widths = tuple(_get_content_width(width) for width in safe_widths)
+    assert content_widths[0] == safe_widths[0]
+    assert content_widths[0] < content_widths[1] < content_widths[2]
+    assert content_widths[1] != 104
+
+    for safe_width, content_width in zip(safe_widths, content_widths):
+        assert 1 <= content_width <= safe_width
+        left, right = _get_horizontal_margin(safe_width, content_width)
+        assert left + content_width + right == safe_width
+        assert left == 0
+        assert right == safe_width - content_width
+
+
+def test_final_markdown_headings_use_focused_brand_style() -> None:
+    for level in range(1, 7):
+        style = _CODELOOP_MARKDOWN_STYLES[f"markdown.h{level}"]
+        assert style.color is not None
+        assert style.color.name == "orange3"
+        assert style.bold is True
+        assert style.underline is False
+        assert style.reverse is False
+
+    rendered = StringIO()
+    renderer = ConsoleRenderer(
+        console=Console(
+            file=rendered,
+            color_system=None,
+            force_terminal=False,
+            width=80,
+        )
+    )
+    renderer.show_result(
+        AgentResult(
+            status="completed",
+            answer="# Left aligned heading\n\nBody.",
+            steps=1,
+        )
+    )
+    heading_line = next(
+        line for line in rendered.getvalue().splitlines() if "Left aligned" in line
+    )
+    assert heading_line.startswith("Left aligned heading")
+    body_line = next(
+        line for line in rendered.getvalue().splitlines() if line.strip() == "Body."
+    )
+    assert body_line.startswith("Body.")
+
+
+def test_owned_tty_input_redraw_is_single_attempt_and_bounded() -> None:
+    class InputConsole(Console):
+        def __init__(self) -> None:
+            super().__init__(
+                file=StringIO(),
+                color_system=None,
+                force_terminal=True,
+                width=100,
+            )
+            self.controls: list[object] = []
+
+        def input(
+            self,
+            prompt: object = "",
+            *args: object,
+            **kwargs: object,
+        ) -> str:
+            del args, kwargs
+            self.print(prompt, end="")
+            return "Review this project"
+
+        def control(self, *control: object) -> None:
+            self.controls.extend(control)
+
+    console = InputConsole()
+    renderer = ConsoleRenderer(console=console)
+    renderer.show_input_top_rule()
+    assert renderer.read_user_input() == "Review this project"
+    renderer.show_submitted_user_message("Review this project")
+
+    assert len(console.controls) == 1
+    assert "❯ Review this project" in console.file.getvalue()
+
+    unsafe_console = InputConsole()
+    unsafe_renderer = ConsoleRenderer(console=unsafe_console)
+    unsafe_renderer.show_input_top_rule()
+    unsafe_renderer.read_user_input()
+    unsafe_renderer._input_had_presentation_output = True
+    unsafe_renderer.show_submitted_user_message("Review this project")
+
+    assert unsafe_console.controls == []
+    assert "❯ Review this project" not in unsafe_console.file.getvalue()
 
 
 def test_live_presentation_is_transient_event_driven_and_final_only(

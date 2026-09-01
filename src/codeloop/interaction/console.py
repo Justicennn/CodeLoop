@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console, Group
+from rich.control import Control
 from rich.live import Live
-from rich.markdown import Markdown
+from rich.markdown import Heading, Markdown, Paragraph
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.segment import ControlType
 from rich.status import Status
 from rich.style import Style
 from rich.syntax import SyntaxTheme
@@ -40,12 +42,16 @@ TRUNCATION_MARKER = "... output truncated ..."
 FAILURE_EVIDENCE_CHARS = FAILURE_OUTPUT_LIMIT
 SUCCESS_EVIDENCE_CHARS = SUCCESS_OUTPUT_LIMIT
 OUTPUT_TRUNCATION_MARKER = TRUNCATION_MARKER
-_ACCENT_STYLE = "cyan"
-_PRIMARY_STYLE = "bold white"
-_MUTED_STYLE = "dim"
+_ACCENT_STYLE = "orange3"
+_PRIMARY_STYLE = "grey93"
+_MUTED_STYLE = "grey62 dim"
 _SUCCESS_STYLE = "green"
-_WARNING_STYLE = "yellow"
+_WARNING_STYLE = "gold3"
 _ERROR_STYLE = "red"
+_USER_MESSAGE_STYLE = Style(color="grey93", bgcolor="grey11")
+_CONTENT_BASE_WIDTH = 88
+_CONTENT_GROWTH_RATIO = 0.45
+_MAX_INPUT_REDRAW_LINES = 6
 _READ_ONLY_TOOLS = frozenset(
     {
         "repository_overview",
@@ -70,10 +76,82 @@ class _TerminalNativeSyntaxTheme(SyntaxTheme):
 
 
 _TERMINAL_NATIVE_SYNTAX_THEME = _TerminalNativeSyntaxTheme()
-_BACKGROUND_FREE_MARKDOWN_STYLES = {
-    "markdown.code": Style(bold=True),
+_CODELOOP_MARKDOWN_STYLES = {
+    **{
+        f"markdown.h{level}": Style(
+            color=_ACCENT_STYLE,
+            bold=True,
+            underline=False,
+            reverse=False,
+        )
+        for level in range(1, 7)
+    },
+    "markdown.paragraph": Style(color=_PRIMARY_STYLE),
+    "markdown.code": Style(color="grey93", bgcolor="grey15", bold=True),
     "markdown.code_block": Style.null(),
+    "markdown.block_quote": Style(color="grey62", dim=True),
+    "markdown.item.bullet": Style(color="grey62"),
+    "markdown.item.number": Style(color="grey62"),
+    "markdown.table.border": Style(color="grey50"),
+    "markdown.table.header": Style(color="grey93", bold=True),
+    "markdown.link": Style(color="bright_blue"),
+    "markdown.link_url": Style(color="blue", underline=True),
 }
+
+
+class _CodeLoopHeading(Heading):
+    """Keep every Markdown heading left-aligned in the terminal."""
+
+    def __rich_console__(self, console: Console, options: Any):
+        del console, options
+        text = self.text
+        text.justify = "left"
+        yield text
+
+
+class _CodeLoopParagraph(Paragraph):
+    """Prevent inherited Markdown layout from centering prose."""
+
+    def __rich_console__(self, console: Console, options: Any):
+        del console, options
+        text = self.text
+        text.justify = "left"
+        yield text
+
+
+class _CodeLoopMarkdown(Markdown):
+    elements = {
+        **Markdown.elements,
+        "heading_open": _CodeLoopHeading,
+        "paragraph_open": _CodeLoopParagraph,
+    }
+
+
+def _get_safe_terminal_width(console_width: int) -> int:
+    """Return a positive render width with one TTY-edge cell reserved."""
+    width = max(1, console_width)
+    return max(1, width - 1)
+
+
+def _get_content_width(safe_width: int) -> int:
+    """Pure responsive reading-width calculation for major UI blocks."""
+    width = max(1, safe_width)
+    if width <= _CONTENT_BASE_WIDTH:
+        return width
+    grown = _CONTENT_BASE_WIDTH + round(
+        (width - _CONTENT_BASE_WIDTH) * _CONTENT_GROWTH_RATIO
+    )
+    return min(width, max(1, grown))
+
+
+def _get_horizontal_margin(
+    safe_width: int,
+    content_width: int,
+) -> tuple[int, int]:
+    """Left-anchor bounded content and leave unused width on the right."""
+    available = max(1, safe_width)
+    content = min(available, max(1, content_width))
+    return 0, available - content
 
 
 class ConsoleRenderer:
@@ -91,16 +169,25 @@ class ConsoleRenderer:
         self._live_disabled = False
         self._live_failed = False
         self._used_live = False
+        self._input_region_active = False
+        self._input_owned = False
+        self._input_start_width: int | None = None
+        self._input_line_count: int | None = None
+        self._input_had_presentation_output = False
 
     def show_header(self, model: str, workspace: Path, task: str) -> None:
-        title = Text("CodeLoop", style="bold cyan")
+        title = Text("CodeLoop", style=f"bold {_ACCENT_STYLE}")
+        title.justify = "left"
         title.append(" · ")
-        title.append(model, style="blue")
+        title.append(model, style=_MUTED_STYLE)
         self.console.print(title)
-        self.console.print(Text(str(workspace), style="dim"))
+        self.console.print(
+            Text(str(workspace), style=_MUTED_STYLE, justify="left")
+        )
         self.console.print()
-        task_line = Text("codeloop > ", style="green")
-        task_line.append(task)
+        task_line = Text("codeloop > ", style=_ACCENT_STYLE)
+        task_line.justify = "left"
+        task_line.append(task, style=_PRIMARY_STYLE)
         self.console.print(task_line)
         self.console.print()
 
@@ -112,54 +199,203 @@ class ConsoleRenderer:
     ) -> None:
         """Render session chrome without touching task PresentationState."""
         metadata = Table.grid(padding=(0, 2), expand=False)
-        metadata.add_column(style=_MUTED_STYLE, no_wrap=True)
-        metadata.add_column(style="white", overflow="fold")
+        metadata.add_column(
+            style=_MUTED_STYLE,
+            no_wrap=True,
+            justify="left",
+        )
+        metadata.add_column(
+            style=_PRIMARY_STYLE,
+            overflow="fold",
+            justify="left",
+        )
         metadata.add_row("model", model)
         metadata.add_row("workspace", str(workspace))
         metadata.add_row("mode", mode)
 
         content = Group(
-            Text("Welcome to CodeLoop", style=_PRIMARY_STYLE),
+            Text(
+                "Welcome to CodeLoop",
+                style=f"bold {_PRIMARY_STYLE}",
+                justify="left",
+            ),
             Text(""),
             metadata,
         )
-        banner_width = min(self.console.width, 104)
+        safe_width, content_width, left, right = self._content_geometry()
+        panel = Panel(
+            Padding(content, (0, 1)),
+            title=Text(" CodeLoop ", style=f"bold {_ACCENT_STYLE}"),
+            title_align="left",
+            border_style=_ACCENT_STYLE,
+            padding=(1, 1),
+            width=content_width,
+            expand=False,
+        )
         self.console.print(
-            Panel(
-                Padding(content, (0, 1)),
-                title=Text(" CodeLoop ", style=f"bold {_ACCENT_STYLE}"),
-                title_align="left",
-                border_style=_ACCENT_STYLE,
-                padding=(1, 1),
-                width=banner_width,
-                expand=False,
-            )
+            Padding(panel, (0, right, 0, left), expand=False),
+            width=safe_width,
         )
         self.console.print()
 
     def show_input_top_rule(self) -> None:
         """Start one terminal-native user input region."""
-        self.console.print(Rule(style=f"{_MUTED_STYLE} {_ACCENT_STYLE}"))
+        self._reset_input_region()
+        if not self.console.is_terminal:
+            return
+        safe_width = self._safe_terminal_width()
+        self._input_region_active = True
+        self._input_start_width = safe_width
+        self.console.print(Rule(style=_MUTED_STYLE), width=safe_width)
 
     def read_user_input(self) -> str:
         """Read from the renderer's real console with an accented prompt."""
-        return self.console.input(Text("> ", style=f"bold {_ACCENT_STYLE}"))
+        if not self.console.is_terminal:
+            return self.console.input("")
+        self._input_region_active = True
+        self._input_owned = True
+        self._input_start_width = self._safe_terminal_width()
+        self._input_line_count = 1
+        value = self.console.input(Text("> ", style=f"bold {_ACCENT_STYLE}"))
+        try:
+            self._input_line_count = self._measure_input_lines(
+                f"> {value}",
+                self._input_start_width,
+            )
+        except Exception:
+            # Measurement only decides whether a redraw is safe. It must never
+            # cause InteractiveSession to ask the user for the same input twice.
+            self._input_line_count = None
+        return value
 
     def show_input_bottom_rule(self) -> None:
-        """Close one submitted user input region."""
-        self.console.print(Rule(style=f"{_MUTED_STYLE} {_ACCENT_STYLE}"))
-        self.console.print()
+        """Legacy compatibility wrapper for callers outside InteractiveSession."""
+        self.cancel_input_area()
+
+    def show_submitted_user_message(self, text: str) -> None:
+        """Best-effort conversion from owned input chrome to a user block."""
+        if not self.console.is_terminal:
+            self._reset_input_region()
+            line = Text("> ", style=_ACCENT_STYLE)
+            line.justify = "left"
+            line.append(text, style=_PRIMARY_STYLE)
+            self.console.print(line)
+            self.console.print()
+            return
+
+        cleared = self._clear_owned_input_area()
+        self._reset_input_region()
+        if not cleared:
+            self.console.print()
+            return
+
+        try:
+            safe_width, _, left, right = self._content_geometry()
+            line = Text("❯ ", style=f"bold {_ACCENT_STYLE}")
+            line.justify = "left"
+            line.append(text, style=_PRIMARY_STYLE)
+            message = Table.grid(expand=True, padding=0)
+            message.add_column(overflow="fold", justify="left")
+            message.add_row(line)
+            block = Padding(
+                message,
+                (0, 1),
+                style=_USER_MESSAGE_STYLE,
+                expand=True,
+            )
+            self.console.print(
+                Padding(block, (0, right, 0, left), expand=True),
+                width=safe_width,
+            )
+            self.console.print()
+        except Exception:
+            # Clearing is best-effort, but once it succeeded the submitted
+            # text must still remain visible if the richer block cannot render.
+            line = Text("> ", style=_ACCENT_STYLE)
+            line.justify = "left"
+            line.append(text, style=_PRIMARY_STYLE)
+            self.console.print(line)
+            self.console.print()
+
+    def cancel_input_area(self) -> None:
+        """Clear owned waiting chrome when the bounded redraw is safe."""
+        if self.console.is_terminal:
+            self._clear_owned_input_area()
+        self._reset_input_region()
 
     def show_goodbye(self) -> None:
-        self.console.print(Text("Bye.", style=_MUTED_STYLE))
+        self.console.print(Text("Bye.", style=_MUTED_STYLE, justify="left"))
+
+    def _safe_terminal_width(self) -> int:
+        return _get_safe_terminal_width(self.console.size.width)
+
+    def _content_geometry(self) -> tuple[int, int, int, int]:
+        safe_width = self._safe_terminal_width()
+        content_width = _get_content_width(safe_width)
+        left, right = _get_horizontal_margin(safe_width, content_width)
+        return safe_width, content_width, left, right
+
+    def _measure_input_lines(self, text: str, width: int) -> int:
+        options = self.console.options.update(width=max(1, width))
+        return max(
+            1,
+            len(
+                self.console.render_lines(
+                    Text(text),
+                    options,
+                    pad=False,
+                )
+            ),
+        )
+
+    def _clear_owned_input_area(self) -> bool:
+        current_width = self._safe_terminal_width()
+        line_count = self._input_line_count
+        if (
+            not self._input_region_active
+            or not self._input_owned
+            or self._input_start_width != current_width
+            or self._input_had_presentation_output
+            or line_count is None
+            or line_count > _MAX_INPUT_REDRAW_LINES
+        ):
+            return False
+
+        codes: list[tuple[ControlType, int]] = []
+        for _ in range(line_count + 1):
+            codes.extend(
+                (
+                    (ControlType.CURSOR_UP, 1),
+                    (ControlType.CURSOR_MOVE_TO_COLUMN, 0),
+                    (ControlType.ERASE_IN_LINE, 2),
+                )
+            )
+        try:
+            self.console.control(Control(*codes))
+        except Exception:
+            return False
+        return True
+
+    def _reset_input_region(self) -> None:
+        self._input_region_active = False
+        self._input_owned = False
+        self._input_start_width = None
+        self._input_line_count = None
+        self._input_had_presentation_output = False
+
+    def _note_presentation_output(self) -> None:
+        if self._input_region_active:
+            self._input_had_presentation_output = True
 
     def start_thinking(self) -> None:
+        self._note_presentation_output()
         if self._live_capable and not self._live_disabled:
             if self._ensure_live():
                 return
         if self._thinking is None:
             self._thinking = self.console.status(
-                "[cyan]Working...[/cyan]", spinner="dots"
+                f"[{_ACCENT_STYLE}]Working...[/{_ACCENT_STYLE}]",
+                spinner="dots",
             )
             self._thinking.start()
 
@@ -190,6 +426,7 @@ class ConsoleRenderer:
 
     def show_narration(self, narration: str) -> None:
         """Render model-provided public narration without inferring intent."""
+        self._note_presentation_output()
         self.stop_thinking()
         text = _compact_answer_spacing(narration)
         if not text:
@@ -205,15 +442,28 @@ class ConsoleRenderer:
         self._render_linear_narration(update.linear_narration or text)
 
     def _render_linear_narration(self, text: str) -> None:
-        with self.console.use_theme(
-            Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
-        ):
-            self.console.print(
-                Markdown(text, code_theme=_TERMINAL_NATIVE_SYNTAX_THEME)
-            )
+        self._render_markdown(text, responsive=False)
         self.console.print()
 
+    def _render_markdown(self, text: str, *, responsive: bool) -> None:
+        markdown = _CodeLoopMarkdown(
+            _compact_answer_spacing(text),
+            code_theme=_TERMINAL_NATIVE_SYNTAX_THEME,
+        )
+        with self.console.use_theme(
+            Theme(_CODELOOP_MARKDOWN_STYLES), inherit=True
+        ):
+            if responsive and self.console.is_terminal:
+                safe_width, _, left, right = self._content_geometry()
+                self.console.print(
+                    Padding(markdown, (0, right, 0, left), expand=True),
+                    width=safe_width,
+                )
+                return
+            self.console.print(markdown)
+
     def show_tool_event(self, event: ToolEvent) -> None:
+        self._note_presentation_output()
         self.stop_thinking()
         try:
             update = self._presentation.observe_tool(event)
@@ -259,6 +509,7 @@ class ConsoleRenderer:
         self.console.print()
 
     def show_core_action_event(self, event: CoreActionEvent) -> None:
+        self._note_presentation_output()
         self.stop_thinking()
         try:
             update = self._presentation.observe_core_action(event)
@@ -272,6 +523,7 @@ class ConsoleRenderer:
             self._render_block(block)
 
     def show_recovery_event(self, event: RecoveryEvent) -> None:
+        self._note_presentation_output()
         self.stop_thinking()
         try:
             update = self._presentation.observe_recovery(event)
@@ -289,6 +541,7 @@ class ConsoleRenderer:
             self._render_block(block)
 
     def show_result(self, result: AgentResult) -> None:
+        self._note_presentation_output()
         live_was_clean = self._used_live and not self._live_failed
         self.close()
         if live_was_clean and not self._live_failed:
@@ -299,10 +552,11 @@ class ConsoleRenderer:
     def _render_live_result(self, result: AgentResult) -> None:
         if result.status != "completed":
             line = Text("✗ ", style=f"bold {_ERROR_STYLE}")
+            line.justify = "left"
             line.append(f"Stopped · {result.status}")
             self.console.print(line)
             if result.message:
-                self.console.print(Text(result.message))
+                self.console.print(Text(result.message, justify="left"))
             self.console.print()
             return
         answer = result.answer or ""
@@ -310,12 +564,7 @@ class ConsoleRenderer:
             self._render_heading("✓", "Done", _SUCCESS_STYLE)
             self.console.print()
             return
-        with self.console.use_theme(
-            Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
-        ):
-            self.console.print(
-                Markdown(answer, code_theme=_TERMINAL_NATIVE_SYNTAX_THEME)
-            )
+        self._render_markdown(answer, responsive=True)
         self.console.print()
 
     def _render_linear_result(self, result: AgentResult) -> None:
@@ -347,7 +596,7 @@ class ConsoleRenderer:
                         PresentationLine(
                             "⚠",
                             "Managed changes are not verified at the current revision",
-                            "yellow",
+                            _WARNING_STYLE,
                         ),
                     ),
                 )
@@ -370,15 +619,7 @@ class ConsoleRenderer:
             answer = result.answer
             if answer.strip():
                 self.console.print()
-                with self.console.use_theme(
-                    Theme(_BACKGROUND_FREE_MARKDOWN_STYLES), inherit=True
-                ):
-                    self.console.print(
-                        Markdown(
-                            answer,
-                            code_theme=_TERMINAL_NATIVE_SYNTAX_THEME,
-                        )
-                    )
+                self._render_markdown(answer, responsive=True)
         self.console.print()
 
     def _ensure_live(self) -> bool:
@@ -469,8 +710,12 @@ class ConsoleRenderer:
             )
 
         facts = Table.grid(padding=(0, 2), expand=False)
-        facts.add_column(style=_MUTED_STYLE, no_wrap=True)
-        facts.add_column(overflow="fold")
+        facts.add_column(
+            style=_MUTED_STYLE,
+            no_wrap=True,
+            justify="left",
+        )
+        facts.add_column(overflow="fold", justify="left")
         for index, finding in enumerate(snapshot.findings):
             label = "发现" if index == 0 else ""
             finding_text = Text()
@@ -541,11 +786,11 @@ class ConsoleRenderer:
         for line in block.lines:
             self._render_heading(line.marker, line.text, line.style)
             if line.detail:
-                self.console.print(Text(f"  {line.detail}", style="dim"))
+                self.console.print(Text(f"  {line.detail}", style=_MUTED_STYLE))
         self.console.print()
 
     def _render_section(self, title: str) -> None:
-        self.console.print(Rule(title, align="left", style="dim"))
+        self.console.print(Rule(title, align="left", style=_MUTED_STYLE))
 
     def _render_command(self, event: ToolEvent) -> None:
         raw_data = event.result.get("data")
@@ -661,6 +906,7 @@ class ConsoleRenderer:
 
     def _render_heading(self, marker: str, title: str, color: str) -> None:
         line = Text(f"{marker} ", style=f"bold {color}")
+        line.justify = "left"
         line.append(title)
         self.console.print(line)
 
@@ -711,7 +957,7 @@ def _action_text(
             line.append(" · ", style=_MUTED_STYLE)
         line.append(target, style=_MUTED_STYLE)
     if count > 1:
-        line.append(f" · {count}x", style=_MUTED_STYLE)
+        line.append(f" · ×{count}", style=_MUTED_STYLE)
     return line
 
 

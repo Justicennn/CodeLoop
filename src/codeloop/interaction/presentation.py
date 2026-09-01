@@ -171,7 +171,7 @@ class PresentationState:
                 PresentationLine(
                     "⚠",
                     "Recovery requested after no material progress",
-                    "yellow",
+                    "gold3",
                 ),
             ),
         )
@@ -282,7 +282,7 @@ class PresentationState:
                             f"{finding.priority.upper()} · "
                             f"{finding.finding_type} · {finding.title}"
                         ),
-                        "yellow" if finding.priority == "high" else "cyan",
+                        "gold3" if finding.priority == "high" else "orange3",
                     )
                     for finding in ordered
                 ),
@@ -356,7 +356,7 @@ class PresentationState:
                 PresentationLine(
                     marker,
                     f"{'created' if marker == '+' else 'modified'} · {path}",
-                    "green" if marker == "+" else "magenta",
+                    "green" if marker == "+" else "orange3",
                 )
                 for path, marker in self._changed_files.items()
             ),
@@ -581,9 +581,9 @@ def _failure_line(name: str, result: Mapping[str, Any]) -> PresentationLine:
 def _plan_line(step: PlanStep) -> PresentationLine:
     marker, style = {
         "completed": ("✓", "green"),
-        "in_progress": ("●", "cyan"),
+        "in_progress": ("●", "orange3"),
         "pending": ("○", "dim"),
-        "blocked": ("⚠", "yellow"),
+        "blocked": ("⚠", "gold3"),
     }[step.status]
     detail = step.blocked_reason if step.status == "blocked" else None
     return PresentationLine(marker, step.description, style, detail)

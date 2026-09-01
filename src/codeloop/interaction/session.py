@@ -160,23 +160,36 @@ class InteractiveSession:
         renderer_has_task_state = False
 
         while True:
-            self._show_input_top_rule(renderer)
+            if self._uses_default_read_line:
+                self._show_input_top_rule(renderer)
             try:
                 raw = self._read_interactive_line(renderer)
             except EOFError:
+                if self._uses_default_read_line:
+                    self._cancel_input_area(renderer)
                 return 0
             except KeyboardInterrupt:
+                if self._uses_default_read_line:
+                    self._cancel_input_area(renderer)
                 self._write_line("Interrupted.")
                 return 130
 
             text = raw.strip()
             if not text:
+                if self._uses_default_read_line:
+                    self._cancel_input_area(renderer)
                 continue
 
-            self._show_input_bottom_rule(renderer)
             if text.casefold() in {"exit", "quit"}:
+                if self._uses_default_read_line:
+                    self._cancel_input_area(renderer)
                 self._show_goodbye(renderer)
                 return 0
+            if text == "/exit":
+                if self._uses_default_read_line:
+                    self._cancel_input_area(renderer)
+            elif self._uses_default_read_line:
+                self._show_submitted_user_message(renderer, text)
 
             command_result = self._handle_command(text)
             if command_result is not None:
@@ -287,6 +300,31 @@ class InteractiveSession:
             return
         self._write_line(_fallback_input_rule())
         self._write_line("")
+
+    def _show_submitted_user_message(
+        self,
+        renderer: ConsoleRenderer | None,
+        text: str,
+    ) -> None:
+        callback = (
+            getattr(renderer, "show_submitted_user_message", None)
+            if renderer is not None
+            else None
+        )
+        if callback is not None and _best_effort(callback, text):
+            return
+        # If Rich presentation is unavailable, retain the existing stable
+        # Rule-delimited transcript instead of duplicating the submitted text.
+        self._show_input_bottom_rule(renderer)
+
+    def _cancel_input_area(self, renderer: ConsoleRenderer | None) -> None:
+        callback = (
+            getattr(renderer, "cancel_input_area", None)
+            if renderer is not None
+            else None
+        )
+        if callback is not None:
+            _best_effort(callback)
 
     def _show_goodbye(self, renderer: ConsoleRenderer | None) -> None:
         callback = (
